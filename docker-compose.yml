@@ -2,7 +2,9 @@ name: weather-tracking
 
 services:
   weather_tracking:
-    build: .
+    build:
+      context: .
+      network: host
     container_name: weather_tracking
     restart: unless-stopped
     ports:
