@@ -1,5 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, Header, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Header, Query, BackgroundTasks, Request
 import os
+import hmac
 from datetime import datetime
 
 from core.database import SessionLocal
@@ -8,9 +9,16 @@ from crawlers import nhc_worker, jtwc_worker
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
 
-def verify_token(x_admin_token: str = Header(None)):
-    expected = os.environ.get("ADMIN_API_TOKEN", "change_me_in_production")
-    if not x_admin_token or x_admin_token != expected:
+def verify_token(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    admin_token: str | None = Query(default=None, alias="admin_token"),
+):
+    expected = os.environ.get("ADMIN_API_TOKEN", "change_me_in_production").strip()
+    provided = (x_admin_token or admin_token or "").strip()
+    
+    if not provided or not hmac.compare_digest(provided, expected):
+        print(f"DEBUG: Token mismatch! Received='{provided}' Expected='{expected}'")
         raise HTTPException(status_code=401, detail="Invalid or missing X-Admin-Token")
 
 @router.get("/status", dependencies=[Depends(verify_token)])
