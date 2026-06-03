@@ -1,0 +1,26 @@
+name: weather-tracking
+
+services:
+  weather_tracking:
+    build: .
+    container_name: weather_tracking
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8002:8002"
+    volumes:
+      - .:/app
+    environment:
+      - TZ=Asia/Ho_Chi_Minh
+      - ADMIN_API_TOKEN=change_me_in_production
+    networks:
+      - weather-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+networks:
+  weather-net:
+    external: true
+    name: weather-net
