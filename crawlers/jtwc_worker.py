@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 from core.database import SessionLocal
 from core.redis import cache_invalidate_storms
 from crawlers.base_worker import (
-    fetch_with_retry,
+    HTTP_SESSION,
     save_raw_file,
     sha256_of_bytes,
     sync_log,
@@ -33,17 +33,7 @@ logger = logging.getLogger(__name__)
 
 SOURCE = "JTWC"
 
-JTWC_PRODUCTS_URL = "https://www.metoc.dc3n.navy.mil/jtwc/products/"
-
-# ATCF deck files per basin on JTWC
-JTWC_ATCF_URLS = {
-    "WP": "https://www.metoc.dc3n.navy.mil/jtwc/products/atcf/jtwc.dat",
-    "IO": "https://www.metoc.dc3n.navy.mil/jtwc/products/atcf/jtwc.dat",
-    "SP": "https://www.metoc.dc3n.navy.mil/jtwc/products/atcf/jtwc.dat",
-}
-
-# Fallback: JTWC makes a-deck files available via ATCF mirror
-ATCF_MIRROR_ADECKS = "https://ftp.nhc.noaa.gov/atcf/btk/"
+NHC_ATCF_BTK_URL = "https://ftp.nhc.noaa.gov/atcf/btk/"
 
 JTWC_BASIN_PREFIXES = {"WP": "wp", "IO": "io", "SH": "sh", "SP": "sh"}
 
@@ -176,32 +166,63 @@ def _parse_atcf_deck(raw_text: str) -> Dict[str, List[dict]]:
     return storms
 
 
-def _fetch_atcf_from_nhc_mirror(basin_prefix: str, year: int) -> Optional[str]:
-    """Fallback: fetch b-deck from NHC ATCF mirror for current season."""
-    url = f"https://ftp.nhc.noaa.gov/atcf/btk/b{basin_prefix}all{year}.dat"
+def _fetch_jtwc_btk_all(year: int) -> Optional[str]:
+    """
+    Fetch all JTWC b-deck files (WP/IO/SH) for the current season from the
+    NHC ATCF btk directory.
+
+    Strategy:
+    1. GET the directory listing HTML from https://ftp.nhc.noaa.gov/atcf/btk/
+    2. Parse <a href="bwpNNyyyy.dat"> / <a href="bioNNyyyy.dat"> / <a href="bshNNyyyy.dat">
+    3. Fetch each matched file and concatenate content.
+
+    This avoids the incorrect `bwpall{year}.dat` filename that was used before
+    (that format does not exist on NHC's server — the real files are per-storm:
+    bwp01YYYY.dat, bwp02YYYY.dat, etc.).
+    """
+    import re
+
     try:
-        resp = fetch_with_retry(url, timeout=30)
-        return resp.text
-    except Exception:
+        dir_resp = HTTP_SESSION.get(NHC_ATCF_BTK_URL, timeout=15)
+        dir_resp.raise_for_status()
+    except Exception as exc:
+        logger.warning(f"[JTWC] btk directory listing failed: {exc}")
         return None
+
+    # Match filenames like bwp012026.dat, bio032026.dat, bsh022026.dat
+    pattern = re.compile(
+        rf'"(b(?:wp|io|sh)\d{{2}}{year}\.dat)"',
+        re.IGNORECASE,
+    )
+    filenames = pattern.findall(dir_resp.text)
+
+    if not filenames:
+        logger.info(f"[JTWC] No WP/IO/SH b-deck files found in btk for {year} — basin is clear")
+        return None
+
+    logger.info(f"[JTWC] Found {len(filenames)} b-deck file(s): {filenames}")
+
+    combined = ""
+    for fname in filenames:
+        try:
+            r = HTTP_SESSION.get(NHC_ATCF_BTK_URL + fname, timeout=20)
+            if r.status_code == 200 and r.text.strip():
+                combined += r.text + "\n"
+        except Exception as exc:
+            logger.debug(f"[JTWC] Failed to fetch {fname}: {exc}")
+
+    return combined.strip() or None
 
 
 def run_jtwc_fetch_active():
-    """Fetch active JTWC storms via ATCF b-deck from NHC mirror (most reliable)."""
+    """Fetch active JTWC storms via ATCF b-deck from NHC btk mirror."""
     year = datetime.now(timezone.utc).year
 
     with sync_log(SOURCE, "jtwc_fetch_active_warnings") as log_data:
-        all_text = ""
-        basins_fetched = 0
+        all_text = _fetch_jtwc_btk_all(year)
 
-        for basin_prefix in ("wp", "io", "sh"):
-            text = _fetch_atcf_from_nhc_mirror(basin_prefix, year)
-            if text:
-                all_text += text + "\n"
-                basins_fetched += 1
-
-        if not all_text.strip():
-            logger.warning("[JTWC] No ATCF data fetched from any basin mirror")
+        if not all_text:
+            logger.info("[JTWC] No active JTWC-basin storms this season yet")
             return
 
         raw = all_text.encode()

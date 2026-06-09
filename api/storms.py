@@ -545,6 +545,7 @@ def get_storms_geojson(db: Session = Depends(get_db)):
         .filter(SourceSyncLog.status == "success")
         .order_by(SourceSyncLog.finished_at.desc())
         .with_entities(SourceSyncLog.finished_at)
+        .limit(1)
         .scalar()
     )
 
