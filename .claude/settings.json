@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls /Users/goodjob/mobile/doan/)",
+      "Read(//Users/goodjob/mobile/doan/**)"
+    ],
+    "additionalDirectories": [
+      "/Users/goodjob/mobile/doan/Weather-Admin/app/routers",
+      "/Users/goodjob/mobile/doan/Weather-Admin/app"
+    ]
+  }
+}
