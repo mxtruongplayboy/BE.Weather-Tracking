@@ -9,7 +9,7 @@ import json
 import logging
 import os
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import geopandas as gpd
@@ -34,6 +34,7 @@ SOURCE = "NHC"
 NHC_ACTIVE_URL = "https://www.nhc.noaa.gov/CurrentStorms.json"
 NHC_GIS_ZIP_URL = "https://www.nhc.noaa.gov/gis/forecast/archive/{storm_id_upper}_5day_latest.zip"
 NHC_ATCF_BTK_URL = "https://ftp.nhc.noaa.gov/atcf/btk/"
+NHC_ATCF_FST_URL = "https://ftp.nhc.noaa.gov/atcf/fst/"
 
 BASIN_MAP = {
     "al": "AL",
@@ -495,6 +496,142 @@ def run_nhc_fetch_track(source_storm_id: str):
     cache_invalidate_storms()
 
 
+def _parse_nhc_fst(raw_text: str) -> list:
+    """Parse ATCF fst text, returning the latest OFCL forecast rows sorted by tau."""
+    rows_by_dtg: dict = {}
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 8:
+            continue
+        if parts[4].strip() != "OFCL":
+            continue
+        dtg = parts[2].strip()
+        lat = _parse_atcf_lat(parts[6]) if len(parts) > 6 else None
+        lon = _parse_atcf_lon(parts[7]) if len(parts) > 7 else None
+        if lat is None or lon is None:
+            continue
+        try:
+            tau = int(parts[5]) if parts[5] else 0
+        except ValueError:
+            tau = 0
+        init_time = _parse_atcf_time(dtg)
+        valid_time = (init_time + timedelta(hours=tau)) if init_time else None
+        try:
+            vmax = float(parts[8]) if len(parts) > 8 and parts[8] else None
+        except ValueError:
+            vmax = None
+        try:
+            mslp = float(parts[9]) if len(parts) > 9 and parts[9] else None
+        except ValueError:
+            mslp = None
+        ty = parts[10].strip() if len(parts) > 10 else ""
+        rows_by_dtg.setdefault(dtg, []).append({
+            "tau": tau,
+            "valid_time": valid_time,
+            "lat": lat,
+            "lon": lon,
+            "vmax_kt": vmax,
+            "mslp_hpa": mslp,
+            "ty": ty,
+        })
+
+    if not rows_by_dtg:
+        return []
+    latest_dtg = max(rows_by_dtg.keys())
+    return sorted(rows_by_dtg[latest_dtg], key=lambda p: p["tau"])
+
+
+def run_nhc_fetch_forecast(source_storm_id: str):
+    """Fetch ATCF fst file and store the latest OFCL forecast track."""
+    fname = f"{source_storm_id}.fst"
+    url = NHC_ATCF_FST_URL + fname
+
+    try:
+        probe = HTTP_SESSION.head(url, timeout=8, allow_redirects=True)
+        if probe.status_code == 404:
+            logger.debug(f"[NHC] No fst file yet for {source_storm_id}")
+            return
+    except Exception:
+        return
+
+    with sync_log(SOURCE, f"nhc_fetch_forecast_{source_storm_id}") as log_data:
+        try:
+            resp = HTTP_SESSION.get(url, timeout=20)
+            resp.raise_for_status()
+        except Exception as exc:
+            logger.warning(f"[NHC] fst fetch failed for {source_storm_id}: {exc}")
+            return
+
+        raw = resp.content
+        if not raw.strip():
+            return
+
+        log_data["checksum"] = sha256_of_bytes(raw)
+        log_data["raw_file_path"] = save_raw_file(
+            SOURCE, f"fst_{source_storm_id}", "txt", raw
+        )
+
+        points = _parse_nhc_fst(resp.text)
+        log_data["records_processed"] = len(points)
+        if not points:
+            return
+
+        db = SessionLocal()
+        try:
+            storm = (
+                db.query(Storm)
+                .filter(Storm.source == SOURCE, Storm.source_storm_id == source_storm_id)
+                .first()
+            )
+            if storm is None:
+                logger.warning(f"[NHC] Storm {source_storm_id} not in DB for forecast upsert")
+                return
+
+            db.query(StormTrackPoint).filter(
+                StormTrackPoint.storm_id == storm.id,
+                StormTrackPoint.point_type == "forecast",
+            ).delete()
+            db.query(StormTrack).filter(
+                StormTrack.storm_id == storm.id,
+                StormTrack.track_type == "forecast",
+            ).delete()
+
+            coords = []
+            for pt in points:
+                category = (
+                    categorize_storm(pt["vmax_kt"], storm.basin) if pt["vmax_kt"] else None
+                )
+                coords.append([pt["lon"], pt["lat"]])
+                db.add(StormTrackPoint(
+                    storm_id=storm.id,
+                    point_type="forecast",
+                    forecast_hour=pt["tau"],
+                    valid_time_utc=pt["valid_time"],
+                    lat=pt["lat"],
+                    lon=pt["lon"],
+                    wind_kt=pt["vmax_kt"],
+                    pressure_hpa=pt["mslp_hpa"],
+                    category=category,
+                ))
+
+            if len(coords) >= 2:
+                db.add(StormTrack(
+                    storm_id=storm.id,
+                    track_type="forecast",
+                    geojson={"type": "LineString", "coordinates": coords},
+                ))
+
+            db.commit()
+            logger.info(f"[NHC] Stored {len(coords)} forecast point(s) for {source_storm_id}")
+        finally:
+            db.close()
+
+    cache_invalidate_storms()
+
+
 def run_nhc_crawler():
     """Main entry point: fetch active + GIS for each storm."""
     logger.info("[NHC] Starting crawler")
@@ -524,5 +661,9 @@ def run_nhc_crawler():
             run_nhc_fetch_track(sid)
         except Exception as e:
             logger.warning(f"[NHC] btk track fetch failed for {sid}: {e}")
+        try:
+            run_nhc_fetch_forecast(sid)
+        except Exception as e:
+            logger.warning(f"[NHC] fst forecast fetch failed for {sid}: {e}")
 
     logger.info(f"[NHC] Done. Processed {len(storm_ids)} active storm(s).")
