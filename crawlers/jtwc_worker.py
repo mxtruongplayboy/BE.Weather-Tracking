@@ -1,84 +1,361 @@
-import requests
-import xml.etree.ElementTree as ET
-from datetime import datetime
+"""
+JTWC Worker - P1
+Covers: West Pacific (WP), Indian Ocean (IO), South Pacific (SP)
+Source: https://www.metoc.dc3n.navy.mil/jtwc/products/
+Polling: active warnings 30 min, best track 1x/day
+
+JTWC publishes text advisories in the ATCF format and also provides
+a products directory listing active storms.
+
+ATCF deck format (A-deck / B-deck columns, space-separated):
+  BASIN, CY, YYYYMMDDHH, TECHNUM, TECH, TAU, LAT, LON, VMAX, MSLP, TY, ...
+
+This parser reads the current warnings index and individual storm files.
+"""
 import logging
-import json
+import re
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
 
 from core.database import SessionLocal
-from models.storm import Storm
+from core.redis import cache_invalidate_storms
+from crawlers.base_worker import (
+    fetch_with_retry,
+    save_raw_file,
+    sha256_of_bytes,
+    sync_log,
+)
+from models.storm_models import Storm, StormTrack, StormTrackPoint
+from utils.geo import compute_movement
+from utils.units import categorize_storm
 
 logger = logging.getLogger(__name__)
 
-GDACS_RSS_URL = "https://www.gdacs.org/xml/rss.xml"
+SOURCE = "JTWC"
 
-def fetch_gdacs_storms():
-    response = requests.get(GDACS_RSS_URL, timeout=15)
-    response.raise_for_status()
-    root = ET.fromstring(response.content)
-    
-    storms = []
-    # GDACS RSS uses namespaces
-    namespaces = {'gdacs': 'http://www.gdacs.org', 'geo': 'http://www.w3.org/2003/01/geo/wgs84_pos#'}
-    
-    for item in root.findall('.//item'):
-        event_type = item.find('gdacs:eventtype', namespaces)
-        if event_type is not None and event_type.text == 'TC': # Tropical Cyclone
-            event_id = item.find('gdacs:eventid', namespaces).text
-            name = item.find('gdacs:eventname', namespaces)
-            name = name.text if name is not None else "Unknown"
-            
-            lat = item.find('geo:lat', namespaces)
-            lon = item.find('geo:long', namespaces)
-            
-            storms.append({
-                "id": f"gdacs_{event_id}",
-                "name": name,
-                "lat": float(lat.text) if lat is not None else None,
-                "lon": float(lon.text) if lon is not None else None
-            })
-            
+JTWC_PRODUCTS_URL = "https://www.metoc.dc3n.navy.mil/jtwc/products/"
+
+# ATCF deck files per basin on JTWC
+JTWC_ATCF_URLS = {
+    "WP": "https://www.metoc.dc3n.navy.mil/jtwc/products/atcf/jtwc.dat",
+    "IO": "https://www.metoc.dc3n.navy.mil/jtwc/products/atcf/jtwc.dat",
+    "SP": "https://www.metoc.dc3n.navy.mil/jtwc/products/atcf/jtwc.dat",
+}
+
+# Fallback: JTWC makes a-deck files available via ATCF mirror
+ATCF_MIRROR_ADECKS = "https://ftp.nhc.noaa.gov/atcf/btk/"
+
+JTWC_BASIN_PREFIXES = {"WP": "wp", "IO": "io", "SH": "sh", "SP": "sh"}
+
+ATCF_TY_CATEGORIES = {
+    "TD": "tropical_depression",
+    "TS": "tropical_storm",
+    "TY": "typhoon",
+    "ST": "violent_typhoon",
+    "TC": "typhoon",
+    "HU": "category_1",
+    "SD": "tropical_depression",
+    "SS": "tropical_storm",
+    "EX": "extratropical",
+    "LO": "low",
+    "WV": "tropical_wave",
+    "ET": "extratropical",
+    "XX": "unknown",
+}
+
+
+def _parse_atcf_lat(s: str) -> Optional[float]:
+    """Parse ATCF lat like '152N' or '85S'."""
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("N"):
+            return float(s[:-1]) / 10.0
+        if s.endswith("S"):
+            return -float(s[:-1]) / 10.0
+        return float(s) / 10.0
+    except ValueError:
+        return None
+
+
+def _parse_atcf_lon(s: str) -> Optional[float]:
+    """Parse ATCF lon like '1324E' or '1786W'."""
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("E"):
+            return float(s[:-1]) / 10.0
+        if s.endswith("W"):
+            return -float(s[:-1]) / 10.0
+        return float(s) / 10.0
+    except ValueError:
+        return None
+
+
+def _parse_atcf_time(dtg: str) -> Optional[datetime]:
+    """Parse ATCF 10-digit DTG YYYYMMDDHH."""
+    dtg = dtg.strip()
+    if len(dtg) < 10:
+        return None
+    try:
+        return datetime.strptime(dtg[:10], "%Y%m%d%H").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _parse_atcf_deck(raw_text: str) -> Dict[str, List[dict]]:
+    """
+    Parse an ATCF A-deck or B-deck text.
+    Returns dict keyed by storm_id (basin+cy) → list of point dicts.
+    """
+    storms: Dict[str, List[dict]] = {}
+
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 8:
+            continue
+
+        basin = parts[0].upper()
+        cy = parts[1].strip().zfill(2)
+        dtg = parts[2].strip()
+        tech = parts[4].strip() if len(parts) > 4 else ""
+        tau_str = parts[5].strip() if len(parts) > 5 else "0"
+        lat_str = parts[6].strip() if len(parts) > 6 else ""
+        lon_str = parts[7].strip() if len(parts) > 7 else ""
+        vmax_str = parts[8].strip() if len(parts) > 8 else ""
+        mslp_str = parts[9].strip() if len(parts) > 9 else ""
+        ty_str = parts[10].strip() if len(parts) > 10 else ""
+
+        # Only ingest BEST or OFCL (official) entries; skip model entries
+        if tech not in ("BEST", "OFCL", ""):
+            continue
+
+        lat = _parse_atcf_lat(lat_str)
+        lon = _parse_atcf_lon(lon_str)
+        if lat is None or lon is None:
+            continue
+
+        valid_time = _parse_atcf_time(dtg)
+        tau = int(tau_str) if tau_str.isdigit() else 0
+
+        try:
+            vmax = float(vmax_str) if vmax_str else None
+        except ValueError:
+            vmax = None
+
+        try:
+            mslp = float(mslp_str) if mslp_str else None
+        except ValueError:
+            mslp = None
+
+        storm_key = f"{basin}{cy}"
+        if storm_key not in storms:
+            storms[storm_key] = []
+
+        storms[storm_key].append(
+            {
+                "basin": basin,
+                "cy": cy,
+                "valid_time": valid_time,
+                "tau": tau,
+                "lat": lat,
+                "lon": lon,
+                "vmax_kt": vmax,
+                "mslp_hpa": mslp,
+                "ty": ty_str,
+                "tech": tech,
+            }
+        )
+
     return storms
 
-def run_jtwc_crawler():
-    """
-    Sử dụng nguồn GDACS (tổng hợp từ JTWC và các trung tâm khác)
-    cho các cơn bão ngoài khu vực Mỹ.
-    """
-    logger.info("Started JTWC/GDACS Storm Crawler")
-    db = SessionLocal()
+
+def _fetch_atcf_from_nhc_mirror(basin_prefix: str, year: int) -> Optional[str]:
+    """Fallback: fetch b-deck from NHC ATCF mirror for current season."""
+    url = f"https://ftp.nhc.noaa.gov/atcf/btk/b{basin_prefix}all{year}.dat"
     try:
-        storms = fetch_gdacs_storms()
-        # Mark GDACS storms as inactive before updating
-        db.query(Storm).filter(Storm.id.like("gdacs_%")).update({"is_active": False})
-        
-        for s in storms:
-            storm = db.query(Storm).filter(Storm.id == s["id"]).first()
-            if not storm:
-                storm = Storm(id=s["id"])
-                db.add(storm)
-                
-            storm.name = s["name"]
-            storm.basin = "Global"
-            storm.is_active = True
-            if s["lat"] is not None: storm.lat = s["lat"]
-            if s["lon"] is not None: storm.lon = s["lon"]
-            storm.last_updated = datetime.utcnow()
-            
-            # TODO: Fetch detailed shapefile/GeoJSON for GDACS event if needed
-            # For now, we only plot the current point.
-            point_geojson = {
-                "type": "Feature",
-                "geometry": {
-                    "type": "Point",
-                    "coordinates": [storm.lon, storm.lat]
-                },
-                "properties": {"name": storm.name}
-            }
-            storm.forecast_track_geojson = json.dumps(point_geojson)
-            
-        db.commit()
-        logger.info(f"Successfully processed {len(storms)} JTWC/GDACS storms.")
+        resp = fetch_with_retry(url, timeout=30)
+        return resp.text
+    except Exception:
+        return None
+
+
+def run_jtwc_fetch_active():
+    """Fetch active JTWC storms via ATCF b-deck from NHC mirror (most reliable)."""
+    year = datetime.now(timezone.utc).year
+
+    with sync_log(SOURCE, "jtwc_fetch_active_warnings") as log_data:
+        all_text = ""
+        basins_fetched = 0
+
+        for basin_prefix in ("wp", "io", "sh"):
+            text = _fetch_atcf_from_nhc_mirror(basin_prefix, year)
+            if text:
+                all_text += text + "\n"
+                basins_fetched += 1
+
+        if not all_text.strip():
+            logger.warning("[JTWC] No ATCF data fetched from any basin mirror")
+            return
+
+        raw = all_text.encode()
+        log_data["checksum"] = sha256_of_bytes(raw)
+        log_data["raw_file_path"] = save_raw_file(SOURCE, "atcf_btk", "txt", raw)
+
+        storm_data = _parse_atcf_deck(all_text)
+        log_data["records_processed"] = len(storm_data)
+
+        db = SessionLocal()
+        try:
+            _upsert_jtwc_storms(storm_data, db)
+            db.commit()
+        finally:
+            db.close()
+
+    cache_invalidate_storms()
+
+
+def _upsert_jtwc_storms(storm_data: Dict[str, List[dict]], db):
+    """Upsert storms parsed from ATCF into the DB."""
+    current_year = datetime.now(timezone.utc).year
+    active_keys = set()
+
+    for storm_key, points in storm_data.items():
+        if not points:
+            continue
+
+        # Filter to only current-year storms
+        recent_points = [
+            p for p in points
+            if p["valid_time"] and p["valid_time"].year == current_year
+        ]
+        if not recent_points:
+            continue
+
+        # Get most recent best-track or forecast point
+        best_points = [p for p in recent_points if p["tech"] == "BEST"]
+        latest = best_points[-1] if best_points else recent_points[-1]
+
+        basin_code = _map_basin(latest["basin"])
+        source_id = storm_key.lower()
+
+        storm = (
+            db.query(Storm)
+            .filter(Storm.source == SOURCE, Storm.source_storm_id == source_id)
+            .first()
+        )
+        if storm is None:
+            storm = Storm(source=SOURCE, source_storm_id=source_id)
+            db.add(storm)
+            db.flush()
+
+        storm.basin = basin_code
+        storm.is_active = True
+        storm.status = "active"
+        storm.lat = latest["lat"]
+        storm.lon = latest["lon"]
+        storm.wind_kt = latest["vmax_kt"]
+        storm.pressure_hpa = latest["mslp_hpa"]
+        storm.last_update_utc = datetime.now(timezone.utc)
+
+        ty = latest["ty"]
+        storm.category = ATCF_TY_CATEGORIES.get(ty) or (
+            categorize_storm(latest["vmax_kt"], basin_code) if latest["vmax_kt"] else None
+        )
+
+        # Observed track from best-track points
+        _rebuild_track(storm, best_points, db)
+
+        # Compute movement from last two best-track points
+        if len(best_points) >= 2:
+            p1, p2 = best_points[-2], best_points[-1]
+            if p1["valid_time"] and p2["valid_time"]:
+                from utils.geo import compute_movement
+                dir_deg, dir_text, speed_kt = compute_movement(
+                    p1["lat"], p1["lon"], p1["valid_time"].timestamp(),
+                    p2["lat"], p2["lon"], p2["valid_time"].timestamp(),
+                )
+                storm.movement_direction_deg = dir_deg
+                storm.movement_direction_text = dir_text
+                storm.movement_speed_kt = speed_kt
+
+        active_keys.add(source_id)
+
+    # Mark storms not in current fetch as inactive
+    (
+        db.query(Storm)
+        .filter(
+            Storm.source == SOURCE,
+            Storm.is_active == True,
+            ~Storm.source_storm_id.in_(active_keys),
+        )
+        .update({"is_active": False, "status": "dissipated"}, synchronize_session=False)
+    )
+
+
+def _rebuild_track(storm, points: list, db):
+    """Replace all observed track points and rebuild LineString."""
+    db.query(StormTrackPoint).filter(
+        StormTrackPoint.storm_id == storm.id,
+        StormTrackPoint.point_type == "observed",
+    ).delete()
+    db.query(StormTrack).filter(
+        StormTrack.storm_id == storm.id,
+        StormTrack.track_type == "observed",
+    ).delete()
+
+    coords = []
+    for pt in points:
+        coords.append([pt["lon"], pt["lat"]])
+        category = ATCF_TY_CATEGORIES.get(pt["ty"]) or (
+            categorize_storm(pt["vmax_kt"], storm.basin) if pt["vmax_kt"] else None
+        )
+        db.add(
+            StormTrackPoint(
+                storm_id=storm.id,
+                point_type="observed",
+                valid_time_utc=pt["valid_time"],
+                lat=pt["lat"],
+                lon=pt["lon"],
+                wind_kt=pt["vmax_kt"],
+                pressure_hpa=pt["mslp_hpa"],
+                category=category,
+            )
+        )
+
+    if len(coords) >= 2:
+        db.add(
+            StormTrack(
+                storm_id=storm.id,
+                track_type="observed",
+                geojson={"type": "LineString", "coordinates": coords},
+            )
+        )
+
+
+def _map_basin(atcf_basin: str) -> str:
+    mapping = {
+        "WP": "WP",
+        "IO": "IO",
+        "SH": "SP",
+        "SP": "SP",
+        "AL": "AL",
+        "EP": "EP",
+        "CP": "CP",
+    }
+    return mapping.get(atcf_basin.upper(), atcf_basin.upper())
+
+
+def run_jtwc_crawler():
+    logger.info("[JTWC] Starting crawler")
+    try:
+        run_jtwc_fetch_active()
     except Exception as e:
-        logger.error(f"JTWC Crawler Error: {e}")
-    finally:
-        db.close()
+        logger.error(f"[JTWC] Crawler error: {e}")
+    logger.info("[JTWC] Done.")

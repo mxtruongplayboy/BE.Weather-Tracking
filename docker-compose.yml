@@ -1,6 +1,39 @@
 name: weather-tracking
 
 services:
+  db:
+    image: postgis/postgis:15-3.4
+    container_name: weather_tracking_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: weather_tracking
+      POSTGRES_USER: weather
+      POSTGRES_PASSWORD: weather_secret
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - weather-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U weather -d weather_tracking"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: weather_tracking_redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redisdata:/data
+    networks:
+      - weather-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
   weather_tracking:
     build:
       context: .
@@ -11,9 +44,18 @@ services:
       - "127.0.0.1:8002:8002"
     volumes:
       - .:/app
+      - raw_data:/app/raw_data
     environment:
       - TZ=Asia/Ho_Chi_Minh
       - ADMIN_API_TOKEN=change_me_in_production
+      - DATABASE_URL=postgresql://weather:weather_secret@db:5432/weather_tracking
+      - REDIS_URL=redis://redis:6379/0
+      - RAW_DATA_DIR=/app/raw_data
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - weather-net
     logging:
@@ -21,6 +63,11 @@ services:
       options:
         max-size: "20m"
         max-file: "3"
+
+volumes:
+  pgdata:
+  redisdata:
+  raw_data:
 
 networks:
   weather-net:
