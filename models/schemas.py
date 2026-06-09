@@ -142,3 +142,74 @@ class HealthResponse(BaseModel):
     status: str
     sources: List[SourceHealthEntry]
     checkedAt: datetime
+
+
+# ── Lightning events ──────────────────────────────────────────────────────────
+
+LIGHTNING_ATTRIBUTION = (
+    "Lightning and storm data sources may include NOAA GOES Geostationary Lightning Mapper (GLM), "
+    "EUMETSAT Meteosat Third Generation Lightning Imager (MTG LI), NASA LIS/OTD historical lightning datasets, "
+    "NOAA/NCEP Global Forecast System (GFS), and tropical cyclone sources used by the storm module. "
+    "This app is not affiliated with or endorsed by NOAA, NASA, EUMETSAT, JMA, JTWC, or any other data provider. "
+    "Forecasts and risk estimates are for informational purposes and should not replace official warnings."
+)
+
+
+class LightningEventOut(BaseModel):
+    id: str
+    source: str
+    eventType: str
+    timeUtc: datetime
+    lat: float
+    lon: float
+    energy: Optional[float] = None
+    quality: Optional[float] = None
+    satellite: Optional[str] = None
+
+
+class RecentLightningResponse(BaseModel):
+    updatedAt: datetime
+    coverageNote: str
+    attribution: str = LIGHTNING_ATTRIBUTION
+    events: List[LightningEventOut]
+    isStale: bool = False
+
+
+# ── Lightning risk ────────────────────────────────────────────────────────────
+
+class RiskTimelineEntry(BaseModel):
+    validTimeUtc: datetime
+    forecastHour: int
+    riskScore: float
+    riskLevel: str            # low | moderate | high | very_high
+    message: str
+    cape_jkg: Optional[float] = None
+    convective_precip_mm: Optional[float] = None
+
+
+class LightningRiskPointResponse(BaseModel):
+    location: Dict[str, float]
+    updatedAt: datetime
+    source: str
+    attribution: str = LIGHTNING_ATTRIBUTION
+    timeline: List[RiskTimelineEntry]
+    isStale: bool = False
+
+
+# ── Hazards summary ───────────────────────────────────────────────────────────
+
+class LightningHazardSummary(BaseModel):
+    realStrikeAvailable: bool
+    riskLevel: Optional[str] = None
+    riskScore: Optional[float] = None
+    message: str
+    coverageNote: str
+
+
+class HazardsSummaryResponse(BaseModel):
+    location: Dict[str, float]
+    radiusKm: float
+    updatedAt: datetime
+    storms: List[Any]
+    lightning: LightningHazardSummary
+    attribution: str = LIGHTNING_ATTRIBUTION

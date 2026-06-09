@@ -19,6 +19,16 @@ class Settings(BaseSettings):
     # Stale threshold minutes — data older than this is flagged isStale
     stale_threshold_minutes: int = 90
 
+    # Lightning module TTLs (seconds)
+    cache_ttl_lightning_events: int = 90       # recent strikes — near-realtime
+    cache_ttl_lightning_risk: int = 1800       # GFS risk — 30 min
+    cache_ttl_lightning_tile: int = 900        # PNG risk tile — 15 min
+    cache_ttl_hazards_summary: int = 180       # unified summary — 3 min
+
+    # EUMETSAT credentials (optional; set to enable MTG LI ingestion)
+    eumetsat_consumer_key: str = ""
+    eumetsat_consumer_secret: str = ""
+
     class Config:
         env_file = ".env"
         extra = "ignore"

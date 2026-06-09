@@ -17,3 +17,12 @@ httpx
 tenacity
 alembic
 pytest
+# Lightning module dependencies
+xarray
+netCDF4
+cfgrib
+eccodes
+boto3
+Pillow
+numpy
+scipy
