@@ -41,7 +41,7 @@ services:
     container_name: weather_tracking
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8002:8002"
+      - "6966:8002"
     volumes:
       - .:/app
       - raw_data:/app/raw_data
