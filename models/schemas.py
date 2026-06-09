@@ -71,6 +71,9 @@ class TrackPoint(BaseModel):
     windKt: Optional[float] = None
     pressureHpa: Optional[float] = None
     category: Optional[str] = None
+    movementDirectionDeg: Optional[float] = None
+    movementDirectionText: Optional[str] = None
+    movementSpeedKt: Optional[float] = None
 
 
 class TrackResponse(BaseModel):

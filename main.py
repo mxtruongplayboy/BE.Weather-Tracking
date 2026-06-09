@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from core.database import Base, engine, init_postgis
+from sqlalchemy import text
 from models import storm_models  # noqa: F401 — registers all ORM models with Base
 
 logging.basicConfig(
@@ -58,6 +59,17 @@ async def startup_event():
     except Exception as e:
         logger.warning(f"PostGIS init warning (may already be enabled): {e}")
     Base.metadata.create_all(bind=engine)
+    # Add per-point movement columns if upgrading from older schema
+    with engine.connect() as conn:
+        for col, typ in [
+            ("movement_direction_deg", "FLOAT"),
+            ("movement_direction_text", "VARCHAR(5)"),
+            ("movement_speed_kt", "FLOAT"),
+        ]:
+            conn.execute(text(
+                f"ALTER TABLE storm_track_points ADD COLUMN IF NOT EXISTS {col} {typ}"
+            ))
+        conn.commit()
     logger.info("Database schema ready.")
 
     # ── NHC (P0) — active every 15 min, forecast/cone every 30 min ──────────

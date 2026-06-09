@@ -74,6 +74,9 @@ class StormTrackPoint(Base):
     wind_kt = Column(Float, nullable=True)
     pressure_hpa = Column(Float, nullable=True)
     category = Column(String(50), nullable=True)
+    movement_direction_deg = Column(Float, nullable=True)
+    movement_direction_text = Column(String(5), nullable=True)
+    movement_speed_kt = Column(Float, nullable=True)
 
     storm = relationship("Storm", back_populates="track_points")
 

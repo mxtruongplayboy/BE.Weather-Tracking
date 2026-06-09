@@ -163,6 +163,16 @@ def _fetch_past_tracks(tc_id: str):
 
                 coords.append([lon, lat])
 
+                dir_deg, dir_text, speed_kt = None, None, None
+                if prev is not None and valid_time and prev["time"]:
+                    dir_deg, dir_text, speed_kt = compute_movement(
+                        prev["lat"], prev["lon"], prev["time"].timestamp(),
+                        lat, lon, valid_time.timestamp(),
+                    )
+                    storm.movement_direction_deg = dir_deg
+                    storm.movement_direction_text = dir_text
+                    storm.movement_speed_kt = speed_kt
+
                 db.add(
                     StormTrackPoint(
                         storm_id=storm.id,
@@ -173,20 +183,11 @@ def _fetch_past_tracks(tc_id: str):
                         wind_kt=wind_kt,
                         pressure_hpa=pressure,
                         category=category,
+                        movement_direction_deg=dir_deg,
+                        movement_direction_text=dir_text,
+                        movement_speed_kt=speed_kt,
                     )
                 )
-
-                # Compute movement from last two points
-                if prev is not None and valid_time:
-                    prev_time_ts = prev["time"].timestamp() if prev["time"] else None
-                    if prev_time_ts:
-                        dir_deg, dir_text, speed_kt = compute_movement(
-                            prev["lat"], prev["lon"], prev_time_ts,
-                            lat, lon, valid_time.timestamp(),
-                        )
-                        storm.movement_direction_deg = dir_deg
-                        storm.movement_direction_text = dir_text
-                        storm.movement_speed_kt = speed_kt
 
                 prev = {"lat": lat, "lon": lon, "time": valid_time}
 
@@ -275,6 +276,7 @@ def _upsert_forecast_track(storm, forecast_list: list, db):
     ).delete()
 
     coords = []
+    prev = None  # {lat, lon, time_ts}
     for item in forecast_list:
         lat = float(item.get("lat") or 0)
         lon = float(item.get("lon") or 0)
@@ -288,6 +290,14 @@ def _upsert_forecast_track(storm, forecast_list: list, db):
         )
 
         coords.append([lon, lat])
+
+        dir_deg, dir_text, speed_kt = None, None, None
+        if prev is not None and valid_time and prev["time_ts"]:
+            dir_deg, dir_text, speed_kt = compute_movement(
+                prev["lat"], prev["lon"], prev["time_ts"],
+                lat, lon, valid_time.timestamp(),
+            )
+
         db.add(
             StormTrackPoint(
                 storm_id=storm.id,
@@ -299,8 +309,14 @@ def _upsert_forecast_track(storm, forecast_list: list, db):
                 wind_kt=wind_kt,
                 pressure_hpa=float(pressure) if pressure else None,
                 category=category,
+                movement_direction_deg=dir_deg,
+                movement_direction_text=dir_text,
+                movement_speed_kt=speed_kt,
             )
         )
+
+        if valid_time:
+            prev = {"lat": lat, "lon": lon, "time_ts": valid_time.timestamp()}
 
     if len(coords) >= 2:
         db.add(

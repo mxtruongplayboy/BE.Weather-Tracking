@@ -332,11 +332,20 @@ def _rebuild_track(storm, points: list, db):
     ).delete()
 
     coords = []
+    prev = None  # {lat, lon, time_ts}
     for pt in points:
         coords.append([pt["lon"], pt["lat"]])
         category = ATCF_TY_CATEGORIES.get(pt["ty"]) or (
             categorize_storm(pt["vmax_kt"], storm.basin) if pt["vmax_kt"] else None
         )
+
+        dir_deg, dir_text, speed_kt = None, None, None
+        if prev is not None and pt["valid_time"] and prev["time_ts"]:
+            dir_deg, dir_text, speed_kt = compute_movement(
+                prev["lat"], prev["lon"], prev["time_ts"],
+                pt["lat"], pt["lon"], pt["valid_time"].timestamp(),
+            )
+
         db.add(
             StormTrackPoint(
                 storm_id=storm.id,
@@ -347,8 +356,14 @@ def _rebuild_track(storm, points: list, db):
                 wind_kt=pt["vmax_kt"],
                 pressure_hpa=pt["mslp_hpa"],
                 category=category,
+                movement_direction_deg=dir_deg,
+                movement_direction_text=dir_text,
+                movement_speed_kt=speed_kt,
             )
         )
+
+        if pt["valid_time"]:
+            prev = {"lat": pt["lat"], "lon": pt["lon"], "time_ts": pt["valid_time"].timestamp()}
 
     if len(coords) >= 2:
         db.add(
@@ -358,6 +373,19 @@ def _rebuild_track(storm, points: list, db):
                 geojson={"type": "LineString", "coordinates": coords},
             )
         )
+
+    # Update storm-level movement from last two observed points
+    if len(points) >= 2:
+        p1, p2 = points[-2], points[-1]
+        if p1["valid_time"] and p2["valid_time"]:
+            dir_deg, dir_text, speed_kt = compute_movement(
+                p1["lat"], p1["lon"], p1["valid_time"].timestamp(),
+                p2["lat"], p2["lon"], p2["valid_time"].timestamp(),
+            )
+            if dir_deg is not None:
+                storm.movement_direction_deg = dir_deg
+                storm.movement_direction_text = dir_text
+                storm.movement_speed_kt = speed_kt
 
 
 def _map_basin(atcf_basin: str) -> str:

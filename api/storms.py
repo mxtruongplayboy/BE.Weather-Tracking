@@ -251,6 +251,9 @@ def get_storm_track(
             windKt=p.wind_kt,
             pressureHpa=p.pressure_hpa,
             category=p.category,
+            movementDirectionDeg=p.movement_direction_deg,
+            movementDirectionText=p.movement_direction_text,
+            movementSpeedKt=p.movement_speed_kt,
         )
         for p in pts
     ]

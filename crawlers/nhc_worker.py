@@ -227,7 +227,7 @@ def _process_forecast_pts(storm, extract_dir: str, db):
         StormTrackPoint.point_type == "forecast",
     ).delete()
 
-    prev_lat = prev_lon = prev_time = None
+    prev = None  # {lat, lon, time_ts}
     for _, row in gdf.iterrows():
         lat = row.geometry.y
         lon = row.geometry.x
@@ -246,18 +246,21 @@ def _process_forecast_pts(storm, extract_dir: str, db):
         pressure = float(row["MINPRES"]) if "MINPRES" in gdf.columns and row["MINPRES"] else None
         category = categorize_storm(wind_kt, storm.basin) if wind_kt else None
 
-        # Update storm movement from tau=0 → tau=12
-        if tau == 0:
-            prev_lat, prev_lon = lat, lon
-            prev_time = valid_time.timestamp() if valid_time else None
-        elif tau == 12 and prev_lat is not None and prev_time is not None and valid_time:
+        # Per-point movement from previous point
+        dir_deg, dir_text, speed_kt = None, None, None
+        if prev is not None and valid_time and prev["time_ts"]:
             dir_deg, dir_text, speed_kt = compute_movement(
-                prev_lat, prev_lon, prev_time, lat, lon, valid_time.timestamp()
+                prev["lat"], prev["lon"], prev["time_ts"],
+                lat, lon, valid_time.timestamp(),
             )
-            if dir_deg is not None:
-                storm.movement_direction_deg = dir_deg
-                storm.movement_direction_text = dir_text
-                storm.movement_speed_kt = speed_kt
+
+        # Update storm-level movement from tau=0 → tau=12
+        if tau == 0 and prev is None:
+            pass  # first point, no movement yet
+        elif tau == 12 and dir_deg is not None:
+            storm.movement_direction_deg = dir_deg
+            storm.movement_direction_text = dir_text
+            storm.movement_speed_kt = speed_kt
 
         pt = StormTrackPoint(
             storm_id=storm.id,
@@ -269,8 +272,14 @@ def _process_forecast_pts(storm, extract_dir: str, db):
             wind_kt=wind_kt,
             pressure_hpa=pressure,
             category=category,
+            movement_direction_deg=dir_deg,
+            movement_direction_text=dir_text,
+            movement_speed_kt=speed_kt,
         )
         db.add(pt)
+
+        if valid_time:
+            prev = {"lat": lat, "lon": lon, "time_ts": valid_time.timestamp()}
 
 
 def _process_forecast_lin(storm, extract_dir: str, db):
@@ -436,6 +445,7 @@ def run_nhc_fetch_track(source_storm_id: str):
             ).delete()
 
             coords = []
+            prev = None  # {lat, lon, time_ts}
             for pt in points:
                 category = (
                     categorize_storm(pt["vmax_kt"], storm.basin)
@@ -443,6 +453,14 @@ def run_nhc_fetch_track(source_storm_id: str):
                     else None
                 )
                 coords.append([pt["lon"], pt["lat"]])
+
+                dir_deg, dir_text, speed_kt = None, None, None
+                if prev is not None and pt["valid_time"] and prev["time_ts"]:
+                    dir_deg, dir_text, speed_kt = compute_movement(
+                        prev["lat"], prev["lon"], prev["time_ts"],
+                        pt["lat"], pt["lon"], pt["valid_time"].timestamp(),
+                    )
+
                 db.add(
                     StormTrackPoint(
                         storm_id=storm.id,
@@ -453,8 +471,14 @@ def run_nhc_fetch_track(source_storm_id: str):
                         wind_kt=pt["vmax_kt"],
                         pressure_hpa=pt["mslp_hpa"],
                         category=category,
+                        movement_direction_deg=dir_deg,
+                        movement_direction_text=dir_text,
+                        movement_speed_kt=speed_kt,
                     )
                 )
+
+                if pt["valid_time"]:
+                    prev = {"lat": pt["lat"], "lon": pt["lon"], "time_ts": pt["valid_time"].timestamp()}
 
             if len(coords) >= 2:
                 db.add(
@@ -465,21 +489,13 @@ def run_nhc_fetch_track(source_storm_id: str):
                     )
                 )
 
-            # Update movement from last two best-track points if not already set
+            # Update storm-level movement from last observed point
             if len(points) >= 2:
                 p1, p2 = points[-2], points[-1]
-                if (
-                    p1["valid_time"]
-                    and p2["valid_time"]
-                    and storm.movement_direction_deg is None
-                ):
+                if p1["valid_time"] and p2["valid_time"]:
                     dir_deg, dir_text, speed_kt = compute_movement(
-                        p1["lat"],
-                        p1["lon"],
-                        p1["valid_time"].timestamp(),
-                        p2["lat"],
-                        p2["lon"],
-                        p2["valid_time"].timestamp(),
+                        p1["lat"], p1["lon"], p1["valid_time"].timestamp(),
+                        p2["lat"], p2["lon"], p2["valid_time"].timestamp(),
                     )
                     if dir_deg is not None:
                         storm.movement_direction_deg = dir_deg
@@ -600,11 +616,20 @@ def run_nhc_fetch_forecast(source_storm_id: str):
             ).delete()
 
             coords = []
+            prev = None  # {lat, lon, time_ts}
             for pt in points:
                 category = (
                     categorize_storm(pt["vmax_kt"], storm.basin) if pt["vmax_kt"] else None
                 )
                 coords.append([pt["lon"], pt["lat"]])
+
+                dir_deg, dir_text, speed_kt = None, None, None
+                if prev is not None and pt["valid_time"] and prev["time_ts"]:
+                    dir_deg, dir_text, speed_kt = compute_movement(
+                        prev["lat"], prev["lon"], prev["time_ts"],
+                        pt["lat"], pt["lon"], pt["valid_time"].timestamp(),
+                    )
+
                 db.add(StormTrackPoint(
                     storm_id=storm.id,
                     point_type="forecast",
@@ -615,7 +640,13 @@ def run_nhc_fetch_forecast(source_storm_id: str):
                     wind_kt=pt["vmax_kt"],
                     pressure_hpa=pt["mslp_hpa"],
                     category=category,
+                    movement_direction_deg=dir_deg,
+                    movement_direction_text=dir_text,
+                    movement_speed_kt=speed_kt,
                 ))
+
+                if pt["valid_time"]:
+                    prev = {"lat": pt["lat"], "lon": pt["lon"], "time_ts": pt["valid_time"].timestamp()}
 
             if len(coords) >= 2:
                 db.add(StormTrack(
