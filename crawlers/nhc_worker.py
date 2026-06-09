@@ -33,6 +33,7 @@ SOURCE = "NHC"
 
 NHC_ACTIVE_URL = "https://www.nhc.noaa.gov/CurrentStorms.json"
 NHC_GIS_ZIP_URL = "https://www.nhc.noaa.gov/gis/forecast/archive/{storm_id_upper}_5day_latest.zip"
+NHC_ATCF_BTK_URL = "https://ftp.nhc.noaa.gov/atcf/btk/"
 
 BASIN_MAP = {
     "al": "AL",
@@ -293,6 +294,207 @@ def _process_forecast_lin(storm, extract_dir: str, db):
     db.add(track)
 
 
+def _parse_atcf_lat(s: str) -> Optional[float]:
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("N"):
+            return float(s[:-1]) / 10.0
+        if s.endswith("S"):
+            return -float(s[:-1]) / 10.0
+        return float(s) / 10.0
+    except ValueError:
+        return None
+
+
+def _parse_atcf_lon(s: str) -> Optional[float]:
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("E"):
+            return float(s[:-1]) / 10.0
+        if s.endswith("W"):
+            return -float(s[:-1]) / 10.0
+        return float(s) / 10.0
+    except ValueError:
+        return None
+
+
+def _parse_atcf_time(dtg: str) -> Optional[datetime]:
+    dtg = dtg.strip()
+    if len(dtg) < 10:
+        return None
+    try:
+        return datetime.strptime(dtg[:10], "%Y%m%d%H").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _parse_nhc_btk(raw_text: str) -> list:
+    """Parse ATCF b-deck text, returning BEST-track rows only."""
+    points = []
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 8:
+            continue
+        tech = parts[4].strip() if len(parts) > 4 else ""
+        if tech != "BEST":
+            continue
+        lat = _parse_atcf_lat(parts[6]) if len(parts) > 6 else None
+        lon = _parse_atcf_lon(parts[7]) if len(parts) > 7 else None
+        if lat is None or lon is None:
+            continue
+        valid_time = _parse_atcf_time(parts[2])
+        try:
+            vmax = float(parts[8]) if len(parts) > 8 and parts[8] else None
+        except ValueError:
+            vmax = None
+        try:
+            mslp = float(parts[9]) if len(parts) > 9 and parts[9] else None
+        except ValueError:
+            mslp = None
+        ty = parts[10].strip() if len(parts) > 10 else ""
+        points.append({
+            "valid_time": valid_time,
+            "lat": lat,
+            "lon": lon,
+            "vmax_kt": vmax,
+            "mslp_hpa": mslp,
+            "ty": ty,
+        })
+    return points
+
+
+def run_nhc_fetch_track(source_storm_id: str):
+    """Fetch ATCF b-deck file for a NHC storm and store its observed track.
+
+    The b-deck filename mirrors the storm id directly:
+      ep022026  →  bep022026.dat
+    """
+    fname = f"b{source_storm_id}.dat"
+    url = NHC_ATCF_BTK_URL + fname
+
+    # Quick HEAD probe — file may not exist yet for brand-new disturbances
+    try:
+        probe = HTTP_SESSION.head(url, timeout=8, allow_redirects=True)
+        if probe.status_code == 404:
+            logger.debug(f"[NHC] No btk file yet for {source_storm_id}")
+            return
+    except Exception:
+        return
+
+    with sync_log(SOURCE, f"nhc_fetch_track_{source_storm_id}") as log_data:
+        try:
+            resp = HTTP_SESSION.get(url, timeout=20)
+            resp.raise_for_status()
+        except Exception as exc:
+            logger.warning(f"[NHC] btk fetch failed for {source_storm_id}: {exc}")
+            return
+
+        raw = resp.content
+        if not raw.strip():
+            return
+
+        log_data["checksum"] = sha256_of_bytes(raw)
+        log_data["raw_file_path"] = save_raw_file(
+            SOURCE, f"btk_{source_storm_id}", "txt", raw
+        )
+
+        points = _parse_nhc_btk(resp.text)
+        log_data["records_processed"] = len(points)
+        if not points:
+            return
+
+        db = SessionLocal()
+        try:
+            storm = (
+                db.query(Storm)
+                .filter(
+                    Storm.source == SOURCE,
+                    Storm.source_storm_id == source_storm_id,
+                )
+                .first()
+            )
+            if storm is None:
+                logger.warning(f"[NHC] Storm {source_storm_id} not in DB for track upsert")
+                return
+
+            # Replace existing observed track
+            db.query(StormTrackPoint).filter(
+                StormTrackPoint.storm_id == storm.id,
+                StormTrackPoint.point_type == "observed",
+            ).delete()
+            db.query(StormTrack).filter(
+                StormTrack.storm_id == storm.id,
+                StormTrack.track_type == "observed",
+            ).delete()
+
+            coords = []
+            for pt in points:
+                category = (
+                    categorize_storm(pt["vmax_kt"], storm.basin)
+                    if pt["vmax_kt"]
+                    else None
+                )
+                coords.append([pt["lon"], pt["lat"]])
+                db.add(
+                    StormTrackPoint(
+                        storm_id=storm.id,
+                        point_type="observed",
+                        valid_time_utc=pt["valid_time"],
+                        lat=pt["lat"],
+                        lon=pt["lon"],
+                        wind_kt=pt["vmax_kt"],
+                        pressure_hpa=pt["mslp_hpa"],
+                        category=category,
+                    )
+                )
+
+            if len(coords) >= 2:
+                db.add(
+                    StormTrack(
+                        storm_id=storm.id,
+                        track_type="observed",
+                        geojson={"type": "LineString", "coordinates": coords},
+                    )
+                )
+
+            # Update movement from last two best-track points if not already set
+            if len(points) >= 2:
+                p1, p2 = points[-2], points[-1]
+                if (
+                    p1["valid_time"]
+                    and p2["valid_time"]
+                    and storm.movement_direction_deg is None
+                ):
+                    dir_deg, dir_text, speed_kt = compute_movement(
+                        p1["lat"],
+                        p1["lon"],
+                        p1["valid_time"].timestamp(),
+                        p2["lat"],
+                        p2["lon"],
+                        p2["valid_time"].timestamp(),
+                    )
+                    if dir_deg is not None:
+                        storm.movement_direction_deg = dir_deg
+                        storm.movement_direction_text = dir_text
+                        storm.movement_speed_kt = speed_kt
+
+            db.commit()
+            logger.info(
+                f"[NHC] Stored {len(coords)} observed track point(s) for {source_storm_id}"
+            )
+        finally:
+            db.close()
+
+    cache_invalidate_storms()
+
+
 def run_nhc_crawler():
     """Main entry point: fetch active + GIS for each storm."""
     logger.info("[NHC] Starting crawler")
@@ -318,5 +520,9 @@ def run_nhc_crawler():
             run_nhc_fetch_gis(sid)
         except Exception as e:
             logger.warning(f"[NHC] GIS fetch failed for {sid}: {e}")
+        try:
+            run_nhc_fetch_track(sid)
+        except Exception as e:
+            logger.warning(f"[NHC] btk track fetch failed for {sid}: {e}")
 
     logger.info(f"[NHC] Done. Processed {len(storm_ids)} active storm(s).")
