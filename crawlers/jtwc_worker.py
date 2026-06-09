@@ -407,4 +407,20 @@ def run_jtwc_crawler():
         run_jtwc_fetch_active()
     except Exception as e:
         logger.error(f"[JTWC] Crawler error: {e}")
+
+    # Fetch satellite images for recently updated storms
+    from crawlers.satellite_image_worker import fetch_and_store_for_storm
+    db = SessionLocal()
+    try:
+        active_storms = db.query(Storm).filter(Storm.source == "JTWC", Storm.is_active == True).all()
+        for storm in active_storms:
+            try:
+                n_imgs = fetch_and_store_for_storm(storm)
+                if n_imgs:
+                    logger.info(f"[JTWC] Stored {n_imgs} satellite image(s) for {storm.source_storm_id}")
+            except Exception as e:
+                logger.warning(f"[JTWC] Satellite image fetch failed for {storm.source_storm_id}: {e}")
+    finally:
+        db.close()
+
     logger.info("[JTWC] Done.")

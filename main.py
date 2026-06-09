@@ -101,6 +101,8 @@ async def startup_event():
             ))
         conn.commit()
 
+    # storm_satellite_images is created via create_all above (new table)
+
     logger.info("Database schema ready.")
     _seed_lightning_sources()
     logger.info("Lightning sources seeded.")

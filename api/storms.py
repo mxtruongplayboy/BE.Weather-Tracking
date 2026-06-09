@@ -26,11 +26,13 @@ from models.schemas import (
     TrackPoint,
     TrackResponse,
 )
+from fastapi.responses import Response
 from models.storm_models import (
     CanonicalStormLink,
     SourceSyncLog,
     Storm,
     StormCone,
+    StormSatelliteImage,
     StormTrack,
     StormTrackPoint,
 )
@@ -562,3 +564,77 @@ def get_storms_geojson(db: Session = Depends(get_db)):
     result = response.dict()
     cache_set(cache_key, result, ttl=settings.cache_ttl_geojson)
     return result
+
+
+# ── Satellite Images ──────────────────────────────────────────────────────────
+
+@router.get("/{storm_id}/satellite-images")
+def list_satellite_images(
+    storm_id: UUID,
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """List satellite image metadata for a storm (no binary data)."""
+    storm = db.query(Storm).filter(Storm.id == storm_id).first()
+    if not storm:
+        raise HTTPException(status_code=404, detail="Storm not found")
+
+    imgs = (
+        db.query(StormSatelliteImage)
+        .filter(
+            StormSatelliteImage.storm_id == storm_id,
+            StormSatelliteImage.image_data != None,  # only successfully fetched
+        )
+        .order_by(StormSatelliteImage.time_utc.desc())
+        .limit(limit)
+        .all()
+    )
+
+    return {
+        "stormId": str(storm_id),
+        "stormName": storm.name,
+        "count": len(imgs),
+        "images": [
+            {
+                "id": img.id,
+                "trackPointId": img.track_point_id,
+                "timeUtc": img.time_utc.isoformat(),
+                "lat": img.lat,
+                "lon": img.lon,
+                "basin": img.basin,
+                "satelliteSource": img.satellite_source,
+                "layerName": img.layer_name,
+                "zoomLevel": img.zoom_level,
+                "tileCol": img.tile_col,
+                "tileRow": img.tile_row,
+                "imageSizeBytes": img.image_size_bytes,
+                "imageFormat": img.image_format,
+                "fetchedAt": img.fetched_at.isoformat() if img.fetched_at else None,
+            }
+            for img in imgs
+        ],
+    }
+
+
+@router.get("/{storm_id}/satellite-images/{image_id}/data")
+def get_satellite_image_data(
+    storm_id: UUID,
+    image_id: int,
+    db: Session = Depends(get_db),
+):
+    """Return raw satellite image bytes (JPEG). Use as <img> src in app."""
+    img = (
+        db.query(StormSatelliteImage)
+        .filter(
+            StormSatelliteImage.storm_id == storm_id,
+            StormSatelliteImage.id == image_id,
+        )
+        .first()
+    )
+    if not img:
+        raise HTTPException(status_code=404, detail="Image not found")
+    if not img.image_data:
+        raise HTTPException(status_code=404, detail="Image data not available for this record")
+
+    media_type = "image/jpeg" if img.image_format in ("jpeg", "jpg") else "image/png"
+    return Response(content=img.image_data, media_type=media_type)

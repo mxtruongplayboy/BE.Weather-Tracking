@@ -389,11 +389,24 @@ def run_jma_crawler():
         logger.error(f"[JMA] targetTc failed: {e}")
         return
 
+    from crawlers.satellite_image_worker import fetch_and_store_for_storm
+
     for tc_id in tc_ids:
         try:
             run_jma_fetch_tc_detail(tc_id)
             logger.info(f"[JMA] Processed TC {tc_id}")
         except Exception as e:
             logger.error(f"[JMA] Detail fetch failed for {tc_id}: {e}")
+
+        # Fetch satellite images for newly added observed track points
+        db = SessionLocal()
+        try:
+            storm = db.query(Storm).filter(Storm.source == "JMA", Storm.source_storm_id == tc_id).first()
+            if storm:
+                n_imgs = fetch_and_store_for_storm(storm)
+                if n_imgs:
+                    logger.info(f"[JMA] Stored {n_imgs} satellite image(s) for {tc_id}")
+        finally:
+            db.close()
 
     logger.info(f"[JMA] Done. {len(tc_ids)} active TC(s).")

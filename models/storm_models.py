@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     Boolean, Column, DateTime, Float, ForeignKey,
-    Integer, String, Text, UniqueConstraint,
+    Integer, LargeBinary, String, Text, UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship
@@ -55,6 +55,7 @@ class Storm(Base):
     track_points = relationship("StormTrackPoint", back_populates="storm", cascade="all, delete-orphan")
     tracks = relationship("StormTrack", back_populates="storm", cascade="all, delete-orphan")
     cones = relationship("StormCone", back_populates="storm", cascade="all, delete-orphan")
+    satellite_images = relationship("StormSatelliteImage", back_populates="storm", cascade="all, delete-orphan")
 
     __table_args__ = (
         UniqueConstraint("source", "source_storm_id", name="uq_source_storm"),
@@ -79,6 +80,7 @@ class StormTrackPoint(Base):
     movement_speed_kt = Column(Float, nullable=True)
 
     storm = relationship("Storm", back_populates="track_points")
+    satellite_image = relationship("StormSatelliteImage", back_populates="track_point", uselist=False)
 
 
 class StormTrack(Base):
@@ -117,6 +119,36 @@ class CanonicalStormLink(Base):
 
     __table_args__ = (
         UniqueConstraint("canonical_id", "storm_id", name="uq_canonical_storm"),
+    )
+
+
+class StormSatelliteImage(Base):
+    __tablename__ = "storm_satellite_images"
+
+    id = Column(Integer, primary_key=True)
+    storm_id = Column(UUID(as_uuid=True), ForeignKey("storms.id", ondelete="CASCADE"), nullable=False, index=True)
+    track_point_id = Column(Integer, ForeignKey("storm_track_points.id", ondelete="SET NULL"), nullable=True, index=True)
+    point_type = Column(String(20), nullable=False, default="observed")
+    time_utc = Column(DateTime(timezone=True), nullable=False, index=True)
+    lat = Column(Float, nullable=False)
+    lon = Column(Float, nullable=False)
+    basin = Column(String(10), nullable=True)
+    satellite_source = Column(String(30), nullable=False)   # GOES_EAST | GOES_WEST | HIMAWARI | VIIRS
+    layer_name = Column(String(100), nullable=False)
+    zoom_level = Column(Integer, nullable=False, default=4)
+    tile_col = Column(Integer, nullable=True)
+    tile_row = Column(Integer, nullable=True)
+    image_data = Column(LargeBinary, nullable=True)
+    image_format = Column(String(10), default="jpeg")
+    image_size_bytes = Column(Integer, nullable=True)
+    fetch_error = Column(String(300), nullable=True)        # non-null when fetch failed
+    fetched_at = Column(DateTime(timezone=True), default=utcnow)
+
+    storm = relationship("Storm", back_populates="satellite_images")
+    track_point = relationship("StormTrackPoint", back_populates="satellite_image")
+
+    __table_args__ = (
+        UniqueConstraint("track_point_id", name="uq_sat_img_per_track_point"),
     )
 
 

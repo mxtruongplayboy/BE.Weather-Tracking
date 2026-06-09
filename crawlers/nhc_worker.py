@@ -683,6 +683,8 @@ def run_nhc_crawler():
     finally:
         db.close()
 
+    from crawlers.satellite_image_worker import fetch_and_store_for_storm
+
     for sid in storm_ids:
         try:
             run_nhc_fetch_gis(sid)
@@ -696,5 +698,16 @@ def run_nhc_crawler():
             run_nhc_fetch_forecast(sid)
         except Exception as e:
             logger.warning(f"[NHC] fst forecast fetch failed for {sid}: {e}")
+
+        # Fetch satellite images for newly added observed track points
+        db = SessionLocal()
+        try:
+            storm = db.query(Storm).filter(Storm.source == SOURCE, Storm.source_storm_id == sid).first()
+            if storm:
+                n_imgs = fetch_and_store_for_storm(storm)
+                if n_imgs:
+                    logger.info(f"[NHC] Stored {n_imgs} satellite image(s) for {sid}")
+        finally:
+            db.close()
 
     logger.info(f"[NHC] Done. Processed {len(storm_ids)} active storm(s).")
