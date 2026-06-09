@@ -17,6 +17,7 @@ import geopandas as gpd
 from core.database import SessionLocal
 from core.redis import cache_invalidate_storms
 from crawlers.base_worker import (
+    HTTP_SESSION,
     fetch_with_retry,
     save_raw_file,
     sha256_of_bytes,
@@ -132,12 +133,20 @@ def run_nhc_fetch_gis(source_storm_id: str):
     storm_id_upper = source_storm_id.upper()
     zip_url = NHC_GIS_ZIP_URL.format(storm_id_upper=storm_id_upper)
 
+    # Quick HEAD probe — GIS packages only exist for named storms with active
+    # official advisories. Pre-named disturbances (e.g. EP022026) return 404
+    # until NHC upgrades them to Tropical Depression/Storm status. Avoid the
+    # 4-retry backoff loop (~30 s) and noisy ERROR logs for these expected 404s.
+    try:
+        probe = HTTP_SESSION.head(zip_url, timeout=8, allow_redirects=True)
+        if probe.status_code == 404:
+            logger.debug(f"[NHC] GIS not published yet for {storm_id_upper}")
+            return
+    except Exception:
+        return  # Network blip — skip GIS silently this cycle
+
     with sync_log(SOURCE, f"nhc_fetch_gis_{source_storm_id}") as log_data:
-        try:
-            resp = fetch_with_retry(zip_url, timeout=30)
-        except Exception:
-            logger.warning(f"NHC GIS zip not available for {storm_id_upper}")
-            raise
+        resp = fetch_with_retry(zip_url, timeout=30)
 
         raw = resp.content
         log_data["checksum"] = sha256_of_bytes(raw)
