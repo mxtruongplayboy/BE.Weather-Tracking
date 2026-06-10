@@ -91,16 +91,18 @@ def _risk_level(score: float) -> str:
 def _discover_latest_gfs_run() -> Optional[tuple[datetime, int]]:
     """
     Find the most recent available GFS run (00/06/12/18 UTC).
+    Tries up to 4 runs back (24 h) to handle NOMADS delays or 500 errors.
     Returns (run_datetime, run_hour) or None.
     """
     now = datetime.now(timezone.utc)
-    # GFS runs at 00, 06, 12, 18 UTC; data available ~4h after run time
-    for hours_back in range(0, 24, 6):
-        candidate = now - timedelta(hours=hours_back)
-        run_hour = (candidate.hour // 6) * 6
-        run_dt = candidate.replace(hour=run_hour, minute=0, second=0, microsecond=0)
+    # GFS runs at 00, 06, 12, 18 UTC; data available ~4h after run time.
+    # Build candidate list: align to 6-hour boundary, then step 6h backwards.
+    aligned_hour = (now.hour // 6) * 6
+    base = now.replace(hour=aligned_hour, minute=0, second=0, microsecond=0)
+    candidates = [base - timedelta(hours=6 * i) for i in range(5)]
 
-        # Verify the f000 file exists for this run
+    for run_dt in candidates:
+        run_hour = run_dt.hour
         date_str = run_dt.strftime("%Y%m%d")
         check_url = (
             f"{NOMADS_BASE}?file=gfs.t{run_hour:02d}z.pgrb2.1p00.f000"
@@ -109,8 +111,9 @@ def _discover_latest_gfs_run() -> Optional[tuple[datetime, int]]:
             f"&dir=/gfs.{date_str}/{run_hour:02d}/atmos"
         )
         try:
-            r = fetch_with_retry(check_url, timeout=10)
-            if len(r.content) > 100:
+            r = fetch_with_retry(check_url, timeout=15)
+            if r.status_code == 200 and len(r.content) > 100:
+                logger.info(f"[GFS RISK] Found available run: {run_dt.isoformat()}")
                 return run_dt, run_hour
         except Exception:
             continue
@@ -125,15 +128,21 @@ def _download_gfs_grib2(run_dt: datetime, run_hour: int, fhour: int) -> Optional
     date_str = run_dt.strftime("%Y%m%d")
     filename = f"gfs.t{run_hour:02d}z.pgrb2.1p00.f{fhour:03d}"
 
+    # lev_surface covers CAPE, CPRAT, PRATE; LFTX is also at surface in GFS pgrb2.
+    # lev_0-500_mb was removed — it is not a valid level for these variables and
+    # causes NOMADS to return 500 when the filter cannot find matching records.
     url = (
         f"{NOMADS_BASE}?file={filename}"
         f"&var_CAPE=on&var_CPRAT=on&var_PRATE=on&var_LFTX=on"
-        f"&lev_surface=on&lev_0-500_mb=on"
+        f"&lev_surface=on"
         f"&leftlon=0&rightlon=360&toplat=90&bottomlat=-90"
         f"&dir=/gfs.{date_str}/{run_hour:02d}/atmos"
     )
     try:
         resp = fetch_with_retry(url, timeout=120)
+        if resp.status_code >= 500:
+            logger.error(f"[GFS RISK] NOMADS 5xx for f{fhour:03d}: {resp.status_code}")
+            return None
         return resp.content
     except Exception as e:
         logger.error(f"[GFS RISK] Download failed for f{fhour:03d}: {e}")

@@ -46,6 +46,19 @@ LAYER_MAP = {
 }
 FALLBACK_LAYER = ("VIIRS_SNPP_CorrectedReflectance_TrueColor", "VIIRS", "jpg")
 
+# These layers update every 10 minutes; GIBS requires full ISO-8601 timestamp
+SUBDAILY_LAYERS = {"GOES-East_ABI_GeoColor", "GOES-West_ABI_GeoColor", "Himawari_AHI_Band03_Red"}
+
+
+def _gibs_time_str(layer: str, time_utc: datetime) -> str:
+    """Return GIBS TIME string: full timestamp for sub-daily layers, date-only for daily."""
+    if layer in SUBDAILY_LAYERS:
+        # Snap to nearest 10-minute interval to match GOES/Himawari scan cadence
+        minute = (time_utc.minute // 10) * 10
+        snapped = time_utc.replace(minute=minute, second=0, microsecond=0)
+        return snapped.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return time_utc.strftime("%Y-%m-%d")
+
 
 def _lat_lon_to_tile(lat: float, lon: float, zoom: int) -> tuple[int, int]:
     """Convert WGS84 lat/lon to GIBS WMTS EPSG:4326 tile (col, row) at given zoom."""
@@ -69,19 +82,20 @@ def _fetch_tile(lat: float, lon: float, time_utc: datetime, basin: str
     Returns (image_bytes, satellite_source, layer_name, col, row) or None.
     """
     layer, source, fmt = LAYER_MAP.get((basin or "").upper(), FALLBACK_LAYER)
-    date_str = time_utc.strftime("%Y-%m-%d")
+    time_str = _gibs_time_str(layer, time_utc)
     col, row = _lat_lon_to_tile(lat, lon, ZOOM)
-    url = _gibs_url(layer, date_str, ZOOM, col, row, fmt)
+    url = _gibs_url(layer, time_str, ZOOM, col, row, fmt)
 
     try:
         resp = fetch_with_retry(url, timeout=30)
         data = resp.content
         # GIBS returns a tiny "no data" tile (~1-2KB) when no imagery exists
         if len(data) < 3000:
-            # If primary layer returned empty tile, try VIIRS fallback
+            # If primary layer returned empty tile, try VIIRS fallback (daily, always available)
             if source != "VIIRS":
                 fb_layer, fb_source, fb_fmt = FALLBACK_LAYER
-                fb_url = _gibs_url(fb_layer, date_str, ZOOM, col, row, fb_fmt)
+                fb_time_str = _gibs_time_str(fb_layer, time_utc)
+                fb_url = _gibs_url(fb_layer, fb_time_str, ZOOM, col, row, fb_fmt)
                 try:
                     fb_resp = fetch_with_retry(fb_url, timeout=30)
                     fb_data = fb_resp.content
@@ -92,7 +106,7 @@ def _fetch_tile(lat: float, lon: float, time_utc: datetime, basin: str
             return None   # genuinely no imagery
         return data, source, layer, col, row
     except Exception as e:
-        logger.warning(f"[SAT IMG] Tile fetch failed ({basin} {lat:.1f},{lon:.1f} {date_str}): {e}")
+        logger.warning(f"[SAT IMG] Tile fetch failed ({basin} {lat:.1f},{lon:.1f} {time_str}): {e}")
         return None
 
 
