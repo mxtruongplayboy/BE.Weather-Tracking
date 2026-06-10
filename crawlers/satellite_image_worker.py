@@ -42,14 +42,14 @@ LOOKBACK_HOURS = 72        # only fetch images for points within this window
 # GIBS returns 400 when no scan exists at the requested time. Avoided here in
 # favour of the reliable daily MODIS products.
 LAYER_MAP = {
-    "AL": ("Terra_MODIS_CorrectedReflectance_TrueColor", "MODIS_TERRA", "250m", 6, "jpg"),
-    "EP": ("Aqua_MODIS_CorrectedReflectance_TrueColor",  "MODIS_AQUA",  "250m", 6, "jpg"),
-    "CP": ("Aqua_MODIS_CorrectedReflectance_TrueColor",  "MODIS_AQUA",  "250m", 6, "jpg"),
-    "WP": ("Terra_MODIS_CorrectedReflectance_TrueColor", "MODIS_TERRA", "250m", 6, "jpg"),
-    "IO": ("VIIRS_SNPP_CorrectedReflectance_TrueColor",  "VIIRS",       "250m", 6, "jpg"),
-    "SH": ("VIIRS_SNPP_CorrectedReflectance_TrueColor",  "VIIRS",       "250m", 6, "jpg"),
+    "AL": ("MODIS_Terra_CorrectedReflectance_TrueColor", "MODIS_TERRA", "250m", 6, "jpg"),
+    "EP": ("MODIS_Aqua_CorrectedReflectance_TrueColor",  "MODIS_AQUA",  "250m", 6, "jpg"),
+    "CP": ("MODIS_Aqua_CorrectedReflectance_TrueColor",  "MODIS_AQUA",  "250m", 6, "jpg"),
+    "WP": ("MODIS_Terra_CorrectedReflectance_TrueColor", "MODIS_TERRA", "250m", 6, "jpg"),
+    "IO": ("MODIS_Aqua_CorrectedReflectance_TrueColor",  "MODIS_AQUA",  "250m", 6, "jpg"),
+    "SH": ("MODIS_Aqua_CorrectedReflectance_TrueColor",  "MODIS_AQUA",  "250m", 6, "jpg"),
 }
-FALLBACK_LAYER = ("VIIRS_SNPP_CorrectedReflectance_TrueColor", "VIIRS", "250m", 6, "jpg")
+FALLBACK_LAYER = ("MODIS_Terra_CorrectedReflectance_TrueColor", "MODIS_TERRA", "250m", 6, "jpg")
 
 
 def _gibs_time_str(layer: str, time_utc: datetime) -> str:  # noqa: ARG001
