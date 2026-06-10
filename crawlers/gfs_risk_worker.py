@@ -163,20 +163,21 @@ def _parse_grib2(data: bytes) -> list[dict]:
             f.write(data)
             tmppath = f.name
 
+        # cfgrib is lazy: keep file alive until all .values are read, then delete.
         try:
             datasets = cfgrib.open_datasets(tmppath)
+
+            # Merge all datasets; .values forces eager load while file still exists
+            merged: dict[str, any] = {}
+            lats = lons = None
+            for ds in datasets:
+                if lats is None and "latitude" in ds.coords:
+                    lats = ds.coords["latitude"].values.copy()
+                    lons = ds.coords["longitude"].values.copy()
+                for var in ds.data_vars:
+                    merged[var.lower()] = ds[var].values.copy()
         finally:
             os.unlink(tmppath)
-
-        # Merge all datasets into one dict of variable arrays
-        merged: dict[str, any] = {}
-        lats = lons = None
-        for ds in datasets:
-            if lats is None and "latitude" in ds.coords:
-                lats = ds.coords["latitude"].values
-                lons = ds.coords["longitude"].values
-            for var in ds.data_vars:
-                merged[var.lower()] = ds[var].values
 
         if lats is None:
             return []

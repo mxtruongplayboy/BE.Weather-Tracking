@@ -30,49 +30,45 @@ from models.storm_models import Storm, StormSatelliteImage, StormTrackPoint
 logger = logging.getLogger(__name__)
 
 GIBS_BASE = "https://gibs.earthdata.nasa.gov/wmts/epsg4326/best"
-TILE_MATRIX_SET = "2km"
-ZOOM = 4          # ~11.25° per tile — shows ~1000km region centred on storm
 MAX_FETCH_PER_STORM = 5    # max new images per crawler run per storm
 LOOKBACK_HOURS = 72        # only fetch images for points within this window
 
-# Basin → (layer_name, satellite_source, format)
+# Layer config: (layer_name, satellite_source, tile_matrix_set, zoom, format)
+# All chosen layers are DAILY (date-only TIME format) and globally available via GIBS.
+# MODIS Terra/Aqua: 250m TileMatrixSet, zoom=6 → ~2.8° per tile (~300 km at equator).
+# VIIRS SNPP: same matrix, used as universal fallback.
+#
+# GOES and Himawari are sub-daily and require an exact observation timestamp;
+# GIBS returns 400 when no scan exists at the requested time. Avoided here in
+# favour of the reliable daily MODIS products.
 LAYER_MAP = {
-    "AL": ("GOES-East_ABI_GeoColor",     "GOES_EAST", "jpg"),
-    "EP": ("GOES-West_ABI_GeoColor",     "GOES_WEST", "jpg"),
-    "CP": ("GOES-West_ABI_GeoColor",     "GOES_WEST", "jpg"),
-    "WP": ("Himawari_AHI_Band03_Red",    "HIMAWARI",  "jpg"),
-    "IO": ("VIIRS_SNPP_CorrectedReflectance_TrueColor", "VIIRS", "jpg"),
-    "SH": ("VIIRS_SNPP_CorrectedReflectance_TrueColor", "VIIRS", "jpg"),
+    "AL": ("Terra_MODIS_CorrectedReflectance_TrueColor", "MODIS_TERRA", "250m", 6, "jpg"),
+    "EP": ("Aqua_MODIS_CorrectedReflectance_TrueColor",  "MODIS_AQUA",  "250m", 6, "jpg"),
+    "CP": ("Aqua_MODIS_CorrectedReflectance_TrueColor",  "MODIS_AQUA",  "250m", 6, "jpg"),
+    "WP": ("Terra_MODIS_CorrectedReflectance_TrueColor", "MODIS_TERRA", "250m", 6, "jpg"),
+    "IO": ("VIIRS_SNPP_CorrectedReflectance_TrueColor",  "VIIRS",       "250m", 6, "jpg"),
+    "SH": ("VIIRS_SNPP_CorrectedReflectance_TrueColor",  "VIIRS",       "250m", 6, "jpg"),
 }
-FALLBACK_LAYER = ("VIIRS_SNPP_CorrectedReflectance_TrueColor", "VIIRS", "jpg")
-
-# These layers update every 10 minutes; GIBS requires full ISO-8601 timestamp
-SUBDAILY_LAYERS = {"GOES-East_ABI_GeoColor", "GOES-West_ABI_GeoColor", "Himawari_AHI_Band03_Red"}
+FALLBACK_LAYER = ("VIIRS_SNPP_CorrectedReflectance_TrueColor", "VIIRS", "250m", 6, "jpg")
 
 
-def _gibs_time_str(layer: str, time_utc: datetime) -> str:
-    """Return GIBS TIME string: full timestamp for sub-daily layers, date-only for daily."""
-    if layer in SUBDAILY_LAYERS:
-        # Snap to nearest 10-minute interval to match GOES/Himawari scan cadence
-        minute = (time_utc.minute // 10) * 10
-        snapped = time_utc.replace(minute=minute, second=0, microsecond=0)
-        return snapped.strftime("%Y-%m-%dT%H:%M:%SZ")
+def _gibs_time_str(layer: str, time_utc: datetime) -> str:  # noqa: ARG001
+    """All layers in LAYER_MAP are daily products; return date-only string."""
     return time_utc.strftime("%Y-%m-%d")
 
 
 def _lat_lon_to_tile(lat: float, lon: float, zoom: int) -> tuple[int, int]:
     """Convert WGS84 lat/lon to GIBS WMTS EPSG:4326 tile (col, row) at given zoom."""
-    # At zoom N: 2^(N+1) columns, 2^N rows; each tile = 180/2^N degrees
-    n_cols = 2 ** (zoom + 1)   # 32 at zoom=4
-    n_rows = 2 ** zoom          # 16 at zoom=4
+    n_cols = 2 ** (zoom + 1)
+    n_rows = 2 ** zoom
     col = int((lon + 180.0) / 360.0 * n_cols) % n_cols
     row = int((90.0 - lat) / 180.0 * n_rows)
     row = max(0, min(n_rows - 1, row))
     return col, row
 
 
-def _gibs_url(layer: str, date_str: str, zoom: int, col: int, row: int, fmt: str) -> str:
-    return f"{GIBS_BASE}/{layer}/default/{date_str}/{TILE_MATRIX_SET}/{zoom}/{row}/{col}.{fmt}"
+def _gibs_url(layer: str, time_str: str, tms: str, zoom: int, col: int, row: int, fmt: str) -> str:
+    return f"{GIBS_BASE}/{layer}/default/{time_str}/{tms}/{zoom}/{row}/{col}.{fmt}"
 
 
 def _fetch_tile(lat: float, lon: float, time_utc: datetime, basin: str
@@ -81,29 +77,29 @@ def _fetch_tile(lat: float, lon: float, time_utc: datetime, basin: str
     Download one GIBS WMTS tile for the given position and time.
     Returns (image_bytes, satellite_source, layer_name, col, row) or None.
     """
-    layer, source, fmt = LAYER_MAP.get((basin or "").upper(), FALLBACK_LAYER)
+    layer, source, tms, zoom, fmt = LAYER_MAP.get((basin or "").upper(), FALLBACK_LAYER)
     time_str = _gibs_time_str(layer, time_utc)
-    col, row = _lat_lon_to_tile(lat, lon, ZOOM)
-    url = _gibs_url(layer, time_str, ZOOM, col, row, fmt)
+    col, row = _lat_lon_to_tile(lat, lon, zoom)
+    url = _gibs_url(layer, time_str, tms, zoom, col, row, fmt)
 
     try:
         resp = fetch_with_retry(url, timeout=30)
         data = resp.content
         # GIBS returns a tiny "no data" tile (~1-2KB) when no imagery exists
         if len(data) < 3000:
-            # If primary layer returned empty tile, try VIIRS fallback (daily, always available)
             if source != "VIIRS":
-                fb_layer, fb_source, fb_fmt = FALLBACK_LAYER
+                fb_layer, fb_source, fb_tms, fb_zoom, fb_fmt = FALLBACK_LAYER
                 fb_time_str = _gibs_time_str(fb_layer, time_utc)
-                fb_url = _gibs_url(fb_layer, fb_time_str, ZOOM, col, row, fb_fmt)
+                fb_col, fb_row = _lat_lon_to_tile(lat, lon, fb_zoom)
+                fb_url = _gibs_url(fb_layer, fb_time_str, fb_tms, fb_zoom, fb_col, fb_row, fb_fmt)
                 try:
                     fb_resp = fetch_with_retry(fb_url, timeout=30)
                     fb_data = fb_resp.content
                     if len(fb_data) >= 3000:
-                        return fb_data, fb_source, fb_layer, col, row
+                        return fb_data, fb_source, fb_layer, fb_col, fb_row
                 except Exception:
                     pass
-            return None   # genuinely no imagery
+            return None
         return data, source, layer, col, row
     except Exception as e:
         logger.warning(f"[SAT IMG] Tile fetch failed ({basin} {lat:.1f},{lon:.1f} {time_str}): {e}")
@@ -153,6 +149,7 @@ def fetch_and_store_for_storm(storm: Storm) -> int:
 
             result = _fetch_tile(pt.lat, pt.lon, pt.valid_time_utc, storm.basin or "")
 
+            _, _, _, zoom, _ = LAYER_MAP.get((storm.basin or "").upper(), FALLBACK_LAYER)
             img = StormSatelliteImage(
                 storm_id=storm.id,
                 track_point_id=pt.id,
@@ -161,7 +158,7 @@ def fetch_and_store_for_storm(storm: Storm) -> int:
                 lat=pt.lat,
                 lon=pt.lon,
                 basin=storm.basin,
-                zoom_level=ZOOM,
+                zoom_level=zoom,
             )
 
             if result:
