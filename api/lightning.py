@@ -74,25 +74,36 @@ def _tile_to_bbox(z: int, x: int, y: int) -> tuple[float, float, float, float]:
 # ── Risk level → RGBA color ───────────────────────────────────────────────────
 
 _RISK_COLORS = {
-    "very_high": (220, 20, 20, 200),    # red
-    "high":      (255, 140, 0, 180),    # orange
-    "moderate":  (255, 215, 0, 150),    # yellow
-    "low":       (0, 200, 80, 80),      # green (mostly transparent)
+    "very_high": (220, 30, 30, 210),    # red — highly opaque
+    "high":      (255, 130, 0, 190),    # orange
+    "moderate":  (255, 210, 0, 160),    # yellow
+    # "low" intentionally omitted — rendered as transparent (no tile fill)
 }
 
 
 def _risk_png_tile(z: int, x: int, y: int, db: Session) -> bytes:
     """
-    Generate a 256×256 PNG heatmap tile for lightning risk.
-    Each pixel represents ~RESOLUTION/256 degrees of the tile.
+    Generate a 256×256 PNG heatmap tile for lightning risk (GFS 1° grid).
+
+    Design decisions:
+    - Only render moderate / high / very_high — skip "low" (too noisy, near-invisible anyway).
+    - Select the single forecast hour whose valid_time is closest to now.
+    - Fill the entire 1° grid cell rather than drawing a circle, so coverage
+      looks solid at all zoom levels (no sparse dots at high zoom).
     """
     try:
         from PIL import Image, ImageDraw
-        import numpy as np
     except ImportError:
-        raise HTTPException(status_code=503, detail="Pillow/numpy not installed for tile rendering")
+        raise HTTPException(status_code=503, detail="Pillow not installed for tile rendering")
 
     TILE_SIZE = 256
+    RESOLUTION_DEG = 1.0  # GFS grid resolution
+
+    def _transparent() -> bytes:
+        buf = io.BytesIO()
+        Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0, 0, 0, 0)).save(buf, format="PNG")
+        return buf.getvalue()
+
     lon_min, lat_min, lon_max, lat_max = _tile_to_bbox(z, x, y)
 
     # Find the latest GFS run
@@ -103,44 +114,78 @@ def _risk_png_tile(z: int, x: int, y: int, db: Session) -> bytes:
         .first()
     )
     if latest_run is None:
-        # Return transparent tile
-        img = Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0, 0, 0, 0))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
+        return _transparent()
 
     run_dt = latest_run[0]
 
-    # Fetch grid points in tile bbox for current valid time (nearest to now)
+    # Pick the forecast hour whose valid_time is closest to now.
+    # This avoids stacking all hours on top of each other.
     now = _utcnow()
+    best_fhour_row = (
+        db.query(LightningRiskForecast.forecast_hour, LightningRiskForecast.valid_time_utc)
+        .filter(
+            LightningRiskForecast.model_source == "GFS",
+            LightningRiskForecast.run_time_utc == run_dt,
+        )
+        .distinct(LightningRiskForecast.forecast_hour)
+        .all()
+    )
+    if not best_fhour_row:
+        return _transparent()
+
+    best_fhour = min(
+        best_fhour_row,
+        key=lambda r: abs((r.valid_time_utc.replace(tzinfo=None) - now.replace(tzinfo=None)).total_seconds()),
+    ).forecast_hour
+
+    # Pad bbox by 1 cell so grid points near the tile edge are included
+    pad = RESOLUTION_DEG
     rows = (
         db.query(LightningRiskForecast)
         .filter(
             LightningRiskForecast.model_source == "GFS",
             LightningRiskForecast.run_time_utc == run_dt,
-            LightningRiskForecast.lat.between(lat_min - 1, lat_max + 1),
-            LightningRiskForecast.lon.between(lon_min - 1, lon_max + 1),
-            LightningRiskForecast.valid_time_utc <= now + timedelta(hours=6),
+            LightningRiskForecast.forecast_hour == best_fhour,
+            LightningRiskForecast.lat.between(lat_min - pad, lat_max + pad),
+            LightningRiskForecast.lon.between(lon_min - pad, lon_max + pad),
+            # Only render meaningful risk — "low" is too faint and creates noise
+            LightningRiskForecast.risk_level.in_(["moderate", "high", "very_high"]),
         )
-        .order_by(LightningRiskForecast.forecast_hour)
         .all()
     )
+
+    if not rows:
+        return _transparent()
 
     img = Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
     lon_range = lon_max - lon_min
     lat_range = lat_max - lat_min
+    if lon_range == 0 or lat_range == 0:
+        return _transparent()
+
+    # Pixels per degree in this tile
+    px_per_deg_lon = TILE_SIZE / lon_range
+    px_per_deg_lat = TILE_SIZE / lat_range
+
+    # Cell size in pixels (1° grid → fill the whole cell)
+    cell_w = max(2, int(RESOLUTION_DEG * px_per_deg_lon))
+    cell_h = max(2, int(RESOLUTION_DEG * px_per_deg_lat))
 
     for row in rows:
-        if lon_range == 0 or lat_range == 0:
+        color = _RISK_COLORS.get(row.risk_level)
+        if color is None:
             continue
-        px = int((row.lon - lon_min) / lon_range * TILE_SIZE)
-        py = int((lat_max - row.lat) / lat_range * TILE_SIZE)
-        color = _RISK_COLORS.get(row.risk_level, (0, 0, 0, 0))
-        # Draw a small filled circle per grid point, scaled with zoom
-        radius = max(2, min(20, int(TILE_SIZE / (2 ** max(0, 7 - z)))))
-        draw.ellipse([px - radius, py - radius, px + radius, py + radius], fill=color)
+        # Centre of the grid cell
+        cx = int((row.lon - lon_min) * px_per_deg_lon)
+        cy = int((lat_max - row.lat) * px_per_deg_lat)
+        # Fill the entire 1° cell (half-cell in each direction)
+        x0 = cx - cell_w // 2
+        y0 = cy - cell_h // 2
+        x1 = cx + cell_w // 2
+        y1 = cy + cell_h // 2
+        draw.rectangle([x0, y0, x1, y1], fill=color)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")

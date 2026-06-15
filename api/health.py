@@ -74,3 +74,12 @@ def health(db: Session = Depends(get_db)):
 @router.get("/health/simple")
 def health_simple():
     return {"status": "ok", "service": "weather-tracking"}
+
+
+# Alias for Docker/Nginx/LB health checks that probe /health instead of /api/v1/health
+alias_router = APIRouter(tags=["health"])
+
+
+@alias_router.get("/health", include_in_schema=False)
+def health_root_alias():
+    return {"status": "ok", "service": "weather-tracking"}

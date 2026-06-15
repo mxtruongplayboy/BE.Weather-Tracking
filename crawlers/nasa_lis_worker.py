@@ -15,6 +15,7 @@ Run as a batch job: weekly or monthly (not realtime).
 """
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -22,6 +23,10 @@ from crawlers.base_worker import fetch_with_retry, save_raw_file, sha256_of_byte
 from core.database import SessionLocal
 
 logger = logging.getLogger(__name__)
+
+# Prevent concurrent runs (manual trigger + cron overlap)
+_NASA_LIS_LOCK = threading.Lock()
+_nasa_lis_running = False
 
 SOURCE = "NASA_LIS"
 
@@ -162,6 +167,17 @@ def _store_climatology(points: list[dict], db) -> int:
     return inserted
 
 
+def _check_network_reachable() -> bool:
+    """Quick connectivity probe to GHRC host before spending retries on it."""
+    import socket
+    try:
+        socket.setdefaulttimeout(5)
+        socket.create_connection(("ghrc.nsstc.nasa.gov", 443), timeout=5).close()
+        return True
+    except OSError:
+        return False
+
+
 def run_nasa_lis_import():
     """
     Batch import NASA LIS/OTD monthly climatology.
@@ -193,3 +209,42 @@ def run_nasa_lis_import():
             logger.info(f"[NASA LIS] Import complete. Stored {n} climatology records")
         finally:
             db.close()
+
+
+def safe_run_nasa_lis_import() -> dict:
+    """
+    Safe wrapper for run_nasa_lis_import used by scheduler and admin trigger.
+    - Prevents concurrent executions via a module-level lock.
+    - Does a quick network probe first to avoid wasting 4 retries × 300 s timeout.
+    - Catches all exceptions so ASGI background tasks and APScheduler jobs
+      never surface an unhandled exception to the server process.
+    Returns a status dict so callers can inspect the outcome.
+    """
+    global _nasa_lis_running
+
+    with _NASA_LIS_LOCK:
+        if _nasa_lis_running:
+            logger.info("[NASA LIS] Already running — skipping duplicate invocation")
+            return {"status": "skipped", "reason": "already_running"}
+        _nasa_lis_running = True
+
+    try:
+        if not _check_network_reachable():
+            logger.warning(
+                "[NASA LIS] Network unreachable (ghrc.nsstc.nasa.gov:443). "
+                "Skipping import — check container outbound connectivity."
+            )
+            return {"status": "skipped", "reason": "network_unreachable"}
+
+        run_nasa_lis_import()
+        return {"status": "ok"}
+    except Exception:
+        logger.exception("[NASA LIS] Import failed — caught by safe wrapper")
+        return {"status": "error"}
+    finally:
+        with _NASA_LIS_LOCK:
+            _nasa_lis_running = False
+
+
+def is_nasa_lis_running() -> bool:
+    return _nasa_lis_running

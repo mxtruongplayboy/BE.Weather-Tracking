@@ -217,9 +217,9 @@ def run_mtg_li_crawler():
     Fails gracefully when credentials are not configured.
     """
     if not _credentials_available():
-        logger.info(
+        logger.debug(
             "[MTG LI] Credentials not configured (EUMETSAT_CONSUMER_KEY / EUMETSAT_CONSUMER_SECRET). "
-            "Skipping MTG LI ingestion. Set env vars to enable."
+            "Skipping MTG LI ingestion."
         )
         return
 

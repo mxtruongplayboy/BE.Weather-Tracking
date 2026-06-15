@@ -20,12 +20,22 @@ import logging
 import math
 import os
 import tempfile
+import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+# cfgrib/xarray emits a FutureWarning about compat='no_conflicts' default changing.
+# This is a library-level warning, not a runtime error; suppress until cfgrib is updated.
+warnings.filterwarnings(
+    "ignore",
+    message=".*default value for compat will change.*",
+    category=FutureWarning,
+    module="cfgrib",
+)
+
 from crawlers.base_worker import fetch_with_retry, save_raw_file, sha256_of_bytes, sync_log
 from core.database import SessionLocal
-from core.redis import cache_delete
+from core.redis import cache_delete, cache_invalidate_lightning_tiles
 from models.lightning_models import LightningRiskForecast
 
 logger = logging.getLogger(__name__)
@@ -153,67 +163,91 @@ def _parse_grib2(data: bytes) -> list[dict]:
     """
     Parse GRIB2 bytes using cfgrib+xarray.
     Returns list of dicts: {lat, lon, cape, cprat, prate, li}.
+
+    Root-cause fix: GFS 1° grid has separate 1-D lat (181) and lon (360) axes.
+    The old code did zip(lat_1d, lon_1d) which stopped at 181 — missing 65 k
+    grid points.  We now build a meshgrid so every (lat, lon) combination is
+    visited, giving the correct 181 × 360 = 65 160 global points.
+
+    Only points with risk_score > 0 are returned so that the caller does not
+    write tens-of-thousands of useless "low / zero" records to the DB.
     """
     try:
         import cfgrib
-        import xarray as xr
         import numpy as np
 
         with tempfile.NamedTemporaryFile(suffix=".grb2", delete=False) as f:
             f.write(data)
             tmppath = f.name
 
-        # cfgrib is lazy: keep file alive until all .values are read, then delete.
         try:
             datasets = cfgrib.open_datasets(tmppath)
 
-            # Merge all datasets; .values forces eager load while file still exists
-            merged: dict[str, any] = {}
-            lats = lons = None
+            merged: dict[str, np.ndarray] = {}
+            lat_1d = lon_1d = None
+
             for ds in datasets:
-                if lats is None and "latitude" in ds.coords:
-                    lats = ds.coords["latitude"].values.copy()
-                    lons = ds.coords["longitude"].values.copy()
+                if lat_1d is None and "latitude" in ds.coords:
+                    lat_1d = ds.coords["latitude"].values.copy()   # shape (181,)
+                    lon_1d = ds.coords["longitude"].values.copy()  # shape (360,)
                 for var in ds.data_vars:
-                    merged[var.lower()] = ds[var].values.copy()
+                    merged[var.lower()] = ds[var].values.copy()    # shape (181, 360)
         finally:
             os.unlink(tmppath)
 
-        if lats is None:
+        if lat_1d is None:
             return []
 
-        result = []
-        lat_arr = lats.flatten() if lats.ndim > 1 else lats
-        lon_arr = lons.flatten() if lons.ndim > 1 else lons
+        # Build full 2-D coordinate grids so every (lat, lon) cell is covered.
+        # indexing='ij' → lats_2d[i,j] = lat_1d[i], lons_2d[i,j] = lon_1d[j]
+        lats_2d, lons_2d = np.meshgrid(lat_1d, lon_1d, indexing="ij")
+        lat_flat = lats_2d.flatten()   # 65 160 values
+        lon_flat = lons_2d.flatten()   # 65 160 values
 
-        cape = merged.get("cape", merged.get("mcape"))
-        cprat = merged.get("cprat")
-        prate = merged.get("prate")
-        lftx = merged.get("lftx", merged.get("4lftx"))
+        cape_arr  = merged.get("cape",  merged.get("mcape"))
+        cprat_arr = merged.get("cprat")
+        prate_arr = merged.get("prate")
+        lftx_arr  = merged.get("lftx",  merged.get("4lftx"))
 
-        def _get(arr, idx):
-            if arr is None:
+        def _flat(arr):
+            return arr.flatten() if arr is not None else None
+
+        cape_f  = _flat(cape_arr)
+        cprat_f = _flat(cprat_arr)
+        prate_f = _flat(prate_arr)
+        lftx_f  = _flat(lftx_arr)
+        n = len(lat_flat)
+
+        def _val(f, i):
+            if f is None or i >= len(f):
                 return None
-            flat = arr.flatten()
-            v = float(flat[idx]) if idx < len(flat) else None
-            return None if (v is None or math.isnan(v)) else v
+            v = float(f[i])
+            return None if math.isnan(v) else v
 
-        for i, (lat, lon) in enumerate(zip(lat_arr, lon_arr)):
-            # Normalize lon to -180..180
-            lon_norm = float(lon) - 360.0 if float(lon) > 180 else float(lon)
-            lat_val = float(lat)
+        result = []
+        for i in range(n):
+            c  = _val(cape_f,  i)
+            cp = _val(cprat_f, i)
+            pr = _val(prate_f, i)
+            li = _val(lftx_f,  i)
 
-            c = _get(cape, i)
-            cp = _get(cprat, i)
-            pr = _get(prate, i)
-            li = _get(lftx, i)
+            # Quick pre-filter: skip points with zero convective signal
+            # (saves ~80-90 % of rows; low-risk areas are not stored at all).
+            has_signal = (
+                (c  is not None and c  > 50)   or   # CAPE > 50 J/kg
+                (cp is not None and cp > 1e-6)  or   # any convective precip
+                (li is not None and li < 0)          # unstable LI
+            )
+            if not has_signal:
+                continue
 
-            # Convert rates from kg/m²/s to mm/h
             cp_mmh = cp * 3600 if cp is not None else None
             pr_mmh = pr * 3600 if pr is not None else None
 
+            lon_norm = float(lon_flat[i]) - 360.0 if float(lon_flat[i]) > 180 else float(lon_flat[i])
+
             result.append({
-                "lat": lat_val,
+                "lat": float(lat_flat[i]),
                 "lon": lon_norm,
                 "cape": c,
                 "cprat_mmh": cp_mmh,
@@ -221,6 +255,7 @@ def _parse_grib2(data: bytes) -> list[dict]:
                 "li": li,
             })
 
+        logger.info(f"[GFS RISK] Parsed {len(result):,} non-zero grid points from {n:,} total")
         return result
 
     except ImportError:
@@ -244,9 +279,14 @@ def _store_risk_grid(points: list[dict], run_dt: datetime, valid_dt: datetime,
         LightningRiskForecast.valid_time_utc == valid_dt,
     ).delete()
 
+    BATCH = 5000
+    total_inserted = 0
     batch = []
+
     for pt in points:
         score = _risk_score(pt["cape"], pt["cprat_mmh"], pt["prate_mmh"], pt["li"])
+        if score <= 0:
+            continue
         batch.append(LightningRiskForecast(
             model_source=MODEL,
             run_time_utc=run_dt,
@@ -262,10 +302,18 @@ def _store_risk_grid(points: list[dict], run_dt: datetime, valid_dt: datetime,
             precip_rate_mmh=pt["prate_mmh"],
             lifted_index=pt["li"],
         ))
+        if len(batch) >= BATCH:
+            db.bulk_save_objects(batch)
+            db.commit()
+            total_inserted += len(batch)
+            batch = []
 
-    db.bulk_save_objects(batch)
-    db.commit()
-    return len(batch)
+    if batch:
+        db.bulk_save_objects(batch)
+        db.commit()
+        total_inserted += len(batch)
+
+    return total_inserted
 
 
 def run_gfs_risk_crawler():
@@ -310,8 +358,9 @@ def run_gfs_risk_crawler():
             finally:
                 db.close()
 
-    # Invalidate risk cache
+    # Invalidate risk cache and PNG tiles so next request gets fresh data
     cache_delete("lightning:risk:latest_run")
+    cache_invalidate_lightning_tiles()
     logger.info(f"[GFS RISK] Done. Total grid points stored: {total}")
 
 

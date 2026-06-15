@@ -289,7 +289,8 @@ CRAWLER_MAP = {
     "goes_glm": goes_glm_worker.run_goes_glm_crawler,
     "gfs_risk": gfs_risk_worker.run_gfs_risk_crawler,
     "mtg_li": mtg_li_worker.run_mtg_li_crawler,
-    "nasa_lis": nasa_lis_worker.run_nasa_lis_import,
+    # nasa_lis uses the safe wrapper: network probe + exception guard + concurrency lock
+    "nasa_lis": nasa_lis_worker.safe_run_nasa_lis_import,
 }
 
 
@@ -302,6 +303,14 @@ def trigger_crawler(crawler_name: str, background_tasks: BackgroundTasks):
             status_code=400,
             detail=f"Unknown crawler '{crawler_name}'. Valid: {sorted(CRAWLER_MAP)}",
         )
+
+    # For nasa_lis, reject immediately if already in progress so admin UI gets honest feedback.
+    if crawler_name.lower() == "nasa_lis" and nasa_lis_worker.is_nasa_lis_running():
+        return {
+            "status": "skipped",
+            "message": "nasa_lis import is already running — please wait for it to finish",
+        }
+
     background_tasks.add_task(fn)
     return {"status": "ok", "message": f"'{crawler_name}' crawler triggered in background"}
 

@@ -51,6 +51,11 @@ services:
       - DATABASE_URL=postgresql://weather:weather_secret@db:5432/weather_tracking
       - REDIS_URL=redis://redis:6379/0
       - RAW_DATA_DIR=/app/raw_data
+      # EUMETSAT MTG LI — Europe/Africa/Middle East lightning (optional)
+      # Get credentials at: https://eoportal.eumetsat.int → Profile → API Credentials
+      # Leave blank to disable MTG LI ingestion (no error, just skipped silently)
+      - EUMETSAT_CONSUMER_KEY=
+      - EUMETSAT_CONSUMER_SECRET=
     depends_on:
       db:
         condition: service_healthy

@@ -190,6 +190,13 @@ def _upsert_ibtracs_storm(db, sid: str, rows: list):
         storm.wind_kt = max_wind_kt
         storm.category = categorize_storm(max_wind_kt, basin)
 
+    # Track the most recent observation time so "recent storms" queries work.
+    valid_times = [r.get("ISO_TIME", "") for r in rows if r.get("ISO_TIME", "").strip()]
+    if valid_times:
+        latest_time = _parse_ibtracs_time(max(valid_times))
+        if latest_time:
+            storm.last_update_utc = latest_time
+
     if len(coords) >= 2:
         db.add(
             StormTrack(

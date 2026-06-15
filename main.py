@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
@@ -40,14 +41,17 @@ app.add_middleware(
 
 from api import admin, health, storms, hazards
 from api.lightning import router as lightning_router, tiles_router as lightning_tiles_router
+from api.route_hazards import router as route_hazards_router
 
 app.include_router(storms.router)
 app.include_router(storms.map_router)
 app.include_router(health.router)
+app.include_router(health.alias_router)  # /health alias for Docker/Nginx health checks
 app.include_router(admin.router)
 app.include_router(lightning_router)
 app.include_router(lightning_tiles_router)
 app.include_router(hazards.router)
+app.include_router(route_hazards_router)
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 
@@ -150,12 +154,18 @@ async def startup_event():
         "cron", hour=3, minute=30, id="lightning_cleanup", max_instances=1, coalesce=True,
     )
 
-    # NASA LIS: weekly historical batch (Sunday 04:00 UTC)
-    scheduler.add_job(
-        nasa_lis_worker.run_nasa_lis_import,
-        "cron", day_of_week="sun", hour=4, minute=0,
-        id="nasa_lis_import", max_instances=1, coalesce=True,
-    )
+    # NASA LIS: weekly historical batch — only schedule if NASA_LIS_ENABLED=true.
+    # Default off because NASA GHRC may block datacenter IPs.
+    # Import manually via: docker exec weather_tracking python3 scripts/import_nasa_lis.py
+    if os.getenv("NASA_LIS_ENABLED", "false").lower() == "true":
+        scheduler.add_job(
+            nasa_lis_worker.safe_run_nasa_lis_import,
+            "cron", day_of_week="sun", hour=4, minute=0,
+            id="nasa_lis_import", max_instances=1, coalesce=True,
+        )
+        logger.info("NASA LIS weekly job scheduled.")
+    else:
+        logger.info("NASA LIS weekly job disabled (NASA_LIS_ENABLED != true).")
 
     scheduler.start()
     logger.info("Scheduler started.")

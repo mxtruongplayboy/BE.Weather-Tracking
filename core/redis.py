@@ -72,3 +72,17 @@ def cache_invalidate_storms():
                 client.delete(*keys)
     except Exception as e:
         logger.warning(f"Cache invalidation error: {e}")
+
+
+def cache_invalidate_lightning_tiles():
+    """Invalidate PNG tile cache after a new GFS run is ingested."""
+    client = get_redis()
+    if not client:
+        return
+    try:
+        keys = client.keys("lightning:risk:tile:png:*")
+        if keys:
+            client.delete(*keys)
+            logger.info(f"Invalidated {len(keys)} lightning risk tile cache entries")
+    except Exception as e:
+        logger.warning(f"Lightning tile cache invalidation error: {e}")

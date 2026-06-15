@@ -144,6 +144,12 @@ def _parse_atcf_deck(raw_text: str) -> Dict[str, List[dict]]:
         except ValueError:
             mslp = None
 
+        # ATCF column 27 (0-indexed) is STORMNAME when present
+        name_str = parts[27].strip() if len(parts) > 27 else ""
+        # Filter placeholder values that ATCF uses when name is unknown
+        if name_str.upper() in ("", "INVEST", "UNKNOWN", "XXX", "UNNAMED"):
+            name_str = ""
+
         storm_key = f"{basin}{cy}"
         if storm_key not in storms:
             storms[storm_key] = []
@@ -160,6 +166,7 @@ def _parse_atcf_deck(raw_text: str) -> Dict[str, List[dict]]:
                 "mslp_hpa": mslp,
                 "ty": ty_str,
                 "tech": tech,
+                "name": name_str,
             }
         )
 
@@ -275,6 +282,13 @@ def _upsert_jtwc_storms(storm_data: Dict[str, List[dict]], db):
             storm = Storm(source=SOURCE, source_storm_id=source_id)
             db.add(storm)
             db.flush()
+
+        # Use the most recent non-empty name across all points for this storm
+        all_names = [p["name"] for p in recent_points if p.get("name")]
+        if all_names:
+            storm.name = all_names[-1].title()
+        elif not storm.name:
+            storm.name = storm_key.upper()
 
         storm.basin = basin_code
         storm.is_active = True

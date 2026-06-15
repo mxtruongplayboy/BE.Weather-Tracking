@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from typing import List, Optional
 from uuid import UUID
 
+from datetime import timedelta
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
@@ -155,6 +157,64 @@ def get_active_storms(db: Session = Depends(get_db)):
 
     result = response.dict()
     cache_set(cache_key, result, ttl=settings.cache_ttl_active_storms)
+    return result
+
+
+# ── GET /recent ───────────────────────────────────────────────────────────────
+
+@router.get("/recent")
+def get_recent_storms(
+    days: int = Query(30, ge=1, le=365, description="Look-back window in days"),
+    db: Session = Depends(get_db),
+):
+    """
+    Returns all storms (active + recent historical) with activity in the last N days.
+    Includes IBTrACS historical storms, filling the map during off-season.
+    Active realtime storms (NHC/JMA/JTWC) always appear regardless of the window.
+    """
+    cache_key = f"storms:recent:{days}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+
+    cutoff = _utcnow() - timedelta(days=days)
+
+    active = db.query(Storm).filter(Storm.is_active == True).all()
+    active_ids = {s.id for s in active}
+
+    historical = (
+        db.query(Storm)
+        .filter(
+            Storm.is_active == False,
+            Storm.last_update_utc >= cutoff,
+        )
+        .order_by(Storm.last_update_utc.desc())
+        .limit(200)
+        .all()
+    )
+
+    all_storms = active + [s for s in historical if s.id not in active_ids]
+    all_storms = _deduplicate_active(all_storms)
+
+    result = {
+        "days": days,
+        "cutoff": cutoff.isoformat(),
+        "count": len(all_storms),
+        "activeCount": sum(1 for s in all_storms if s.is_active),
+        "historicalCount": sum(1 for s in all_storms if not s.is_active),
+        "attribution": ATTRIBUTION,
+        "storms": [
+            {
+                **_storm_to_summary(s).dict(),
+                "isActive": s.is_active,
+                "status": s.status,
+                "lastUpdateUtc": s.last_update_utc.isoformat() if s.last_update_utc else None,
+            }
+            for s in all_storms
+        ],
+    }
+
+    cache_set(cache_key, result, ttl=300)
     return result
 
 
@@ -470,18 +530,44 @@ def _compute_risk(
 # ── GET /map/storms.geojson ───────────────────────────────────────────────────
 
 @map_router.get("/storms.geojson", response_model=GeoJSONResponse)
-def get_storms_geojson(db: Session = Depends(get_db)):
-    cache_key = "map:storms_geojson"
+def get_storms_geojson(
+    include_recent_days: int = Query(
+        14,
+        ge=0,
+        le=90,
+        description="Also include historical storms active within this many days (0 = active only)",
+    ),
+    db: Session = Depends(get_db),
+):
+    cache_key = f"map:storms_geojson:{include_recent_days}"
     cached = cache_get(cache_key)
     if cached:
         return cached
 
     active = db.query(Storm).filter(Storm.is_active == True).all()
-    active = _deduplicate_active(active)
+    active_ids = {s.id for s in active}
+
+    recent_historical: list[Storm] = []
+    if include_recent_days > 0:
+        cutoff = _utcnow() - timedelta(days=include_recent_days)
+        recent_historical = (
+            db.query(Storm)
+            .filter(
+                Storm.is_active == False,
+                Storm.last_update_utc >= cutoff,
+            )
+            .order_by(Storm.last_update_utc.desc())
+            .limit(100)
+            .all()
+        )
+        recent_historical = [s for s in recent_historical if s.id not in active_ids]
+
+    all_storms = _deduplicate_active(active) + recent_historical
 
     features = []
 
-    for s in active:
+    for s in all_storms:
+        is_active = s.is_active
         # Current position feature
         if s.lat is not None and s.lon is not None:
             features.append(
@@ -496,7 +582,9 @@ def get_storms_geojson(db: Session = Depends(get_db)):
                         "windKt": s.wind_kt,
                         "pressureHpa": s.pressure_hpa,
                         "category": s.category,
-                        "featureType": "current_position",
+                        "isActive": is_active,
+                        "status": s.status,
+                        "featureType": "current_position" if is_active else "historical_position",
                     },
                 }
             )
@@ -518,12 +606,41 @@ def get_storms_geojson(db: Session = Depends(get_db)):
                     "properties": {
                         "id": str(s.id),
                         "name": s.name,
-                        "featureType": "forecast_track",
+                        "isActive": is_active,
+                        "featureType": "forecast_track" if is_active else "historical_track",
                     },
                 }
             )
 
-        # Cone polygon
+        # Observed track for historical storms (IBTrACS)
+        if not is_active:
+            observed_track = (
+                db.query(StormTrack)
+                .filter(
+                    StormTrack.storm_id == s.id,
+                    StormTrack.track_type == "observed",
+                )
+                .first()
+            )
+            if observed_track and observed_track.geojson:
+                features.append(
+                    {
+                        "type": "Feature",
+                        "geometry": observed_track.geojson,
+                        "properties": {
+                            "id": str(s.id),
+                            "name": s.name,
+                            "basin": s.basin,
+                            "source": s.source,
+                            "maxWindKt": s.wind_kt,
+                            "category": s.category,
+                            "isActive": False,
+                            "featureType": "historical_track",
+                        },
+                    }
+                )
+
+        # Cone polygon (active storms only)
         cone = (
             db.query(StormCone)
             .filter(
@@ -532,7 +649,7 @@ def get_storms_geojson(db: Session = Depends(get_db)):
             )
             .first()
         )
-        if cone and cone.geojson:
+        if cone and cone.geojson and is_active:
             features.append(
                 {
                     "type": "Feature",
@@ -540,6 +657,7 @@ def get_storms_geojson(db: Session = Depends(get_db)):
                     "properties": {
                         "id": str(s.id),
                         "name": s.name,
+                        "isActive": True,
                         "featureType": "forecast_cone",
                     },
                 }
