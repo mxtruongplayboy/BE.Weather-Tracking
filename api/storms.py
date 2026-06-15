@@ -89,6 +89,7 @@ def _storm_to_summary(s: Storm) -> StormSummary:
         movementDirectionDeg=s.movement_direction_deg,
         movementSpeedKt=s.movement_speed_kt,
         lastUpdateUtc=s.last_update_utc,
+        isActive=s.is_active,
     )
 
 
@@ -124,17 +125,41 @@ def _deduplicate_active(storms: List[Storm]) -> List[Storm]:
 
 # ── GET /active ───────────────────────────────────────────────────────────────
 
+RECENT_DISSIPATED_DAYS = 14  # bão đã tan vẫn trả về trong 14 ngày
+
+
 @router.get("/active", response_model=ActiveStormsResponse)
 def get_active_storms(db: Session = Depends(get_db)):
-    cache_key = "storms:active"
+    """
+    Trả về:
+    - Tất cả bão đang hoạt động (is_active=True)
+    - Bão đã tan trong vòng 14 ngày gần nhất (is_active=False, last_update_utc >= now-14d)
+    Sau 14 ngày kể từ khi tan, bão không còn xuất hiện trong kết quả.
+    """
+    cache_key = "storms:active:14d"
     cached = cache_get(cache_key)
     if cached:
         return cached
 
-    active = db.query(Storm).filter(Storm.is_active == True).all()
-    active = _deduplicate_active(active)
+    cutoff = _utcnow() - timedelta(days=RECENT_DISSIPATED_DAYS)
 
-    summaries = [_storm_to_summary(s) for s in active]
+    active = db.query(Storm).filter(Storm.is_active == True).all()
+    active_ids = {s.id for s in active}
+
+    recently_dissipated = (
+        db.query(Storm)
+        .filter(
+            Storm.is_active == False,
+            Storm.last_update_utc >= cutoff,
+        )
+        .order_by(Storm.last_update_utc.desc())
+        .all()
+    )
+
+    all_storms = active + [s for s in recently_dissipated if s.id not in active_ids]
+    all_storms = _deduplicate_active(all_storms)
+
+    summaries = [_storm_to_summary(s) for s in all_storms]
 
     # Determine staleness from the most recent sync
     latest_sync = (

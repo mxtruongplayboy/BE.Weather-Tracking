@@ -22,6 +22,7 @@ class StormSummary(BaseModel):
     movementDirectionDeg: Optional[float] = None
     movementSpeedKt: Optional[float] = None
     lastUpdateUtc: Optional[datetime] = None
+    isActive: bool = True
 
     class Config:
         from_attributes = True

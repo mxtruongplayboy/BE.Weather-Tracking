@@ -324,6 +324,68 @@ def get_lightning_risk_at_point(
     return response
 
 
+@router.get("/risk-zones")
+def get_lightning_risk_zones(
+    bbox: Optional[str] = Query(None, description="minLon,minLat,maxLon,maxLat"),
+    min_risk: float = Query(0.55, ge=0.3, le=1.0),
+    limit: int = Query(400, ge=1, le=1000),
+    db: Session = Depends(get_db),
+):
+    """
+    Public endpoint: return current GFS high-risk grid points for mobile clustering.
+    Mobile uses these as cluster markers (zoom-in = spread, zoom-out = group).
+    Only moderate/high/very_high risk zones are returned.
+    """
+    cache_key = f"lightning:risk:zones:{min_risk}:{bbox or 'global'}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+
+    latest_run = (
+        db.query(LightningRiskForecast.run_time_utc)
+        .filter(LightningRiskForecast.model_source == "GFS")
+        .order_by(LightningRiskForecast.run_time_utc.desc())
+        .first()
+    )
+    if not latest_run:
+        return {"runTime": None, "count": 0, "points": []}
+
+    q = db.query(LightningRiskForecast).filter(
+        LightningRiskForecast.model_source == "GFS",
+        LightningRiskForecast.run_time_utc == latest_run[0],
+        LightningRiskForecast.forecast_hour == 0,
+        LightningRiskForecast.risk_score >= min_risk,
+    )
+    if bbox:
+        try:
+            min_lon, min_lat, max_lon, max_lat = [float(v) for v in bbox.split(",")]
+            q = q.filter(
+                LightningRiskForecast.lat.between(min_lat, max_lat),
+                LightningRiskForecast.lon.between(min_lon, max_lon),
+            )
+        except Exception:
+            raise HTTPException(status_code=400, detail="bbox must be minLon,minLat,maxLon,maxLat")
+
+    rows = q.order_by(LightningRiskForecast.risk_score.desc()).limit(limit).all()
+
+    result = {
+        "runTime": latest_run[0].isoformat(),
+        "count": len(rows),
+        "points": [
+            {
+                "lat": r.lat,
+                "lon": r.lon,
+                "riskScore": round(r.risk_score, 2),
+                "riskLevel": r.risk_level,
+                "capeJkg": r.cape_jkg,
+            }
+            for r in rows
+        ],
+    }
+    cache_set(cache_key, result, ttl=settings.cache_ttl_lightning_risk)
+    return result
+
+
 @tiles_router.get("/lightning-risk/{z}/{x}/{y}.png")
 def lightning_risk_tile_png(
     z: int, x: int, y: int,
