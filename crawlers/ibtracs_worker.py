@@ -133,7 +133,13 @@ def _upsert_ibtracs_storm(db, sid: str, rows: list):
     storm.basin = basin
     storm.is_active = False       # historical data
     storm.status = "historical"
-    storm.canonical_id = f"{basin}-{season}-{sid[-4:]}"
+
+    # Prefer USA_ATCF_ID (e.g. "EP032026") as canonical_id so IBTrACS storms
+    # deduplicate correctly against NHC/JTWC records that use the same ATCF format.
+    atcf_ids = {r.get("USA_ATCF_ID", "").strip().upper() for r in rows}
+    atcf_ids.discard("")
+    atcf_ids.discard("0")
+    storm.canonical_id = atcf_ids.pop() if atcf_ids else f"{basin}-{season}-{sid[-4:]}"
 
     # Delete old track points
     db.query(StormTrackPoint).filter(

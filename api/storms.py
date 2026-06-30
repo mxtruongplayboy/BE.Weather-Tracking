@@ -95,9 +95,14 @@ def _storm_to_summary(s: Storm) -> StormSummary:
 
 def _deduplicate_active(storms: List[Storm]) -> List[Storm]:
     """
-    For West Pacific, if a storm appears in both JMA and JTWC with nearly the
-    same position, keep only the primary-source entry.
-    Simple approach: group by canonical_id and pick the preferred source.
+    Deduplicate storms that appear from multiple sources (NHC+IBTrACS, JMA+JTWC, etc.).
+
+    Two passes:
+    1. Group by canonical_id (after IBTrACS fix, NHC and IBTrACS share ATCF IDs).
+    2. Fallback: group remaining storms by (normalized_name, basin) to catch cases
+       where USA_ATCF_ID was absent in IBTrACS (e.g. non-US basins).
+
+    Winner priority per basin: BASIN_PRIMARY_SOURCE → first entry.
     """
     by_canonical: dict[str, List[Storm]] = {}
     no_canonical: List[Storm] = []
@@ -113,14 +118,47 @@ def _deduplicate_active(storms: List[Storm]) -> List[Storm]:
         if len(group) == 1:
             result.append(group[0])
             continue
-        # Pick by basin primary source preference
         basin = group[0].basin or ""
         preferred_source = BASIN_PRIMARY_SOURCE.get(basin, "NHC")
         winner = next((s for s in group if s.source == preferred_source), group[0])
         result.append(winner)
 
-    result.extend(no_canonical)
-    return result
+    # Pass 2: deduplicate no_canonical by (name.upper, basin)
+    by_name_basin: dict[tuple, List[Storm]] = {}
+    for s in no_canonical:
+        key = (s.name.upper().strip() if s.name else "", s.basin or "")
+        by_name_basin.setdefault(key, []).append(s)
+
+    for (name, basin), group in by_name_basin.items():
+        if len(group) == 1:
+            result.append(group[0])
+            continue
+        preferred_source = BASIN_PRIMARY_SOURCE.get(basin, "NHC")
+        winner = next((s for s in group if s.source == preferred_source), group[0])
+        result.append(winner)
+
+    # Pass 2b: cross-check result list for name+basin duplicates that slipped through
+    # (e.g. one entry had canonical_id and one didn't but they're the same storm)
+    seen: dict[tuple, Storm] = {}
+    final: List[Storm] = []
+    for s in result:
+        key = (s.name.upper().strip() if s.name else "", s.basin or "")
+        if key in seen:
+            # Keep the one from preferred source
+            basin = s.basin or ""
+            preferred_source = BASIN_PRIMARY_SOURCE.get(basin, "NHC")
+            existing = seen[key]
+            if s.source == preferred_source and existing.source != preferred_source:
+                # Replace existing with current
+                final = [x for x in final if x is not existing]
+                seen[key] = s
+                final.append(s)
+            # else keep existing
+        else:
+            seen[key] = s
+            final.append(s)
+
+    return final
 
 
 # ── GET /active ───────────────────────────────────────────────────────────────
