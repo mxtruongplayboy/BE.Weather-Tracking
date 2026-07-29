@@ -163,7 +163,7 @@ def _deduplicate_active(storms: List[Storm]) -> List[Storm]:
 
 # ── GET /active ───────────────────────────────────────────────────────────────
 
-RECENT_DISSIPATED_DAYS = 14  # bão đã tan vẫn trả về trong 14 ngày
+RECENT_DISSIPATED_DAYS = 3  # bão đã tan vẫn trả về trong 3 ngày
 
 
 @router.get("/active", response_model=ActiveStormsResponse)
@@ -171,10 +171,10 @@ def get_active_storms(db: Session = Depends(get_db)):
     """
     Trả về:
     - Tất cả bão đang hoạt động (is_active=True)
-    - Bão đã tan trong vòng 14 ngày gần nhất (is_active=False, last_update_utc >= now-14d)
-    Sau 14 ngày kể từ khi tan, bão không còn xuất hiện trong kết quả.
+    - Bão đã tan trong vòng 3 ngày gần nhất (is_active=False, last_update_utc >= now-3d)
+    Sau 3 ngày kể từ khi tan, bão không còn xuất hiện trong kết quả.
     """
-    cache_key = "storms:active:14d"
+    cache_key = "storms:active:3d"
     cached = cache_get(cache_key)
     if cached:
         return cached
