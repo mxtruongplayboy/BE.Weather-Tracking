@@ -48,6 +48,12 @@ def _credentials_available() -> bool:
     )
 
 
+def is_configured() -> bool:
+    """MTG LI đã có credential để chạy chưa — api/lightning.py hỏi cái này để
+    biết có nên hứa vùng phủ của MTG với client hay không."""
+    return _credentials_available()
+
+
 def _get_access_token() -> Optional[str]:
     """Obtain Bearer token from EUMETSAT OAuth2 endpoint."""
     import requests

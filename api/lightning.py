@@ -30,6 +30,7 @@ from models.schemas import (
     LIGHTNING_ATTRIBUTION,
 )
 from crawlers.gfs_risk_worker import query_risk_at_point, RISK_MESSAGES
+from crawlers.mtg_li_worker import is_configured as mtg_is_configured
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,8 @@ GOES_COVERAGE_LAT_MAX = 65.0
 # MTG LI approximate coverage: lon -65..65, lat -65..65
 MTG_COVERAGE_LON_MIN = -65.0
 MTG_COVERAGE_LON_MAX = 65.0
+MTG_COVERAGE_LAT_MIN = -65.0
+MTG_COVERAGE_LAT_MAX = 65.0
 
 
 def _utcnow() -> datetime:
@@ -57,8 +60,33 @@ def _bbox_in_goes_coverage(min_lon: float, max_lon: float,
             and min_lat <= GOES_COVERAGE_LAT_MAX and max_lat >= GOES_COVERAGE_LAT_MIN)
 
 
+def _bbox_in_mtg_coverage(min_lon: float, max_lon: float,
+                          min_lat: float, max_lat: float) -> bool:
+    return (min_lon <= MTG_COVERAGE_LON_MAX and max_lon >= MTG_COVERAGE_LON_MIN
+            and min_lat <= MTG_COVERAGE_LAT_MAX and max_lat >= MTG_COVERAGE_LAT_MIN)
+
+
+def _real_strike_sources(min_lon: float, max_lon: float,
+                         min_lat: float, max_lat: float) -> list[str]:
+    """
+    Vệ tinh nào thật sự phủ khung nhìn này VÀ đang bật.
+
+    Trước đây chỉ hỏi mỗi GOES, nên MTG_COVERAGE_* nằm đó không ai dùng: kể cả
+    khi đã điền credential EUMETSAT và sự kiện MTG LI đã nằm trong DB, người
+    dùng châu Âu/châu Phi vẫn bị trả lời "vùng này không có dữ liệu thật".
+
+    MTG chỉ được tính khi có credential — không thì hứa suông một nguồn đang tắt.
+    """
+    sources = []
+    if _bbox_in_goes_coverage(min_lon, max_lon, min_lat, max_lat):
+        sources.append("GOES GLM")
+    if mtg_is_configured() and _bbox_in_mtg_coverage(min_lon, max_lon, min_lat, max_lat):
+        sources.append("MTG LI")
+    return sources
+
+
 def _point_has_real_strike(lat: float, lon: float) -> bool:
-    return _bbox_in_goes_coverage(lon, lon, lat, lat)
+    return bool(_real_strike_sources(lon, lon, lat, lat))
 
 
 def _tile_to_bbox(z: int, x: int, y: int) -> tuple[float, float, float, float]:
@@ -241,18 +269,21 @@ def get_recent_lightning_events(
     events = q.all()
 
     # Determine coverage note
-    has_goes_coverage = (
-        min_lon is None or _bbox_in_goes_coverage(min_lon, max_lon, min_lat, max_lat)
-    )
-    if has_goes_coverage:
+    if min_lon is None:
+        # Truy vấn toàn cầu: liệt kê mọi nguồn đang bật, không nói về một vùng nào.
+        covering = ["GOES GLM"] + (["MTG LI"] if mtg_is_configured() else [])
+    else:
+        covering = _real_strike_sources(min_lon, max_lon, min_lat, max_lat)
+
+    if covering:
         coverage_note = (
-            "Real lightning strike data available for Americas and adjacent oceans (NOAA GOES GLM). "
-            "Outside this region, only lightning risk forecast is available."
+            f"Real lightning strike data available for this area via {' + '.join(covering)}. "
+            "Outside satellite coverage, only lightning risk forecast is available."
         )
     else:
         coverage_note = (
             "Live strike data unavailable for this region; showing lightning risk instead. "
-            "Real data available only within GOES/MTG satellite coverage."
+            "No geostationary lightning imager currently covers it."
         )
 
     event_list = [

@@ -153,6 +153,7 @@ def _upsert_ibtracs_storm(db, sid: str, rows: list):
 
     coords = []
     max_wind_kt = 0.0
+    fixes = []  # (iso_time, lat, lon, pressure) — để lấy vị trí cuối cùng
 
     for row in rows:
         lat_s = row.get("LAT", "").strip()
@@ -178,6 +179,7 @@ def _upsert_ibtracs_storm(db, sid: str, rows: list):
 
         category = categorize_storm(wind_kt, basin) if wind_kt else None
         coords.append([lon, lat])
+        fixes.append((iso_time, lat, lon, pressure))
 
         db.add(
             StormTrackPoint(
@@ -192,7 +194,23 @@ def _upsert_ibtracs_storm(db, sid: str, rows: list):
             )
         )
 
+    # Gán vị trí cho chính bản ghi Storm, không chỉ cho các điểm track.
+    #
+    # Thiếu đúng bốn dòng này là lý do 16 cơn bão Tây Bắc Thái Bình Dương có mặt
+    # trong DB nhưng vô hình trên bản đồ: /api/v1/storms/* trả lat/lon = null,
+    # StormModel.hasPosition thành false, storm_map_layer bỏ qua. Các điểm track
+    # vẫn có toạ độ đầy đủ — chỉ dòng tóm tắt là trống.
+    if fixes:
+        dated = [f for f in fixes if f[0] is not None]
+        _, storm.lat, storm.lon, last_pressure = (
+            max(dated, key=lambda f: f[0]) if dated else fixes[-1]
+        )
+        if last_pressure:
+            storm.pressure_hpa = last_pressure
+
     if max_wind_kt > 0:
+        # Có chủ đích dùng đỉnh chứ không phải giá trị cuối: đây là bão đã tan,
+        # mô tả nó bằng cường độ mạnh nhất trong đời mới có ý nghĩa.
         storm.wind_kt = max_wind_kt
         storm.category = categorize_storm(max_wind_kt, basin)
 
