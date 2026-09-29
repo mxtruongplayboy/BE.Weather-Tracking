@@ -58,6 +58,7 @@ app.include_router(route_hazards_router)
 from crawlers import (
     ibtracs_worker, jma_worker, jtwc_worker, nhc_worker,
     goes_glm_worker, gfs_risk_worker, mtg_li_worker, nasa_lis_worker,
+    maintenance,
 )
 
 scheduler = AsyncIOScheduler(timezone="UTC")
@@ -154,6 +155,12 @@ async def startup_event():
         "cron", hour=3, minute=30, id="lightning_cleanup", max_instances=1, coalesce=True,
     )
 
+    # Daily disk/DB housekeeping: raw payload files, sync logs, old GFS risk runs
+    scheduler.add_job(
+        maintenance.run_maintenance,
+        "cron", hour=3, minute=45, id="maintenance", max_instances=1, coalesce=True,
+    )
+
     # NASA LIS: weekly historical batch — only schedule if NASA_LIS_ENABLED=true.
     # Default off because NASA GHRC may block datacenter IPs.
     # Import manually via: docker exec weather_tracking python3 scripts/import_nasa_lis.py
@@ -169,6 +176,9 @@ async def startup_event():
 
     scheduler.start()
     logger.info("Scheduler started.")
+
+    # Housekeeping first so a boot after a disk-full outage reclaims space
+    asyncio.get_event_loop().run_in_executor(None, maintenance.run_maintenance)
 
     # Run P0 crawlers once at startup
     asyncio.get_event_loop().run_in_executor(None, nhc_worker.run_nhc_crawler)

@@ -33,7 +33,8 @@ warnings.filterwarnings(
     module="cfgrib",
 )
 
-from crawlers.base_worker import fetch_with_retry, save_raw_file, sha256_of_bytes, sync_log
+from crawlers.base_worker import fetch_with_retry, get_last_sync, save_raw_file, sha256_of_bytes, sync_log
+from core.config import settings
 from core.database import SessionLocal
 from core.redis import cache_delete, cache_invalidate_lightning_tiles
 from models.lightning_models import LightningRiskForecast
@@ -329,9 +330,18 @@ def run_gfs_risk_crawler():
         return
 
     run_dt, run_hour = result
+
+    # GFS publishes a new run every 6h but this job polls every 30 min. Without
+    # this guard every poll re-downloaded and re-inserted the same run.
+    run_job = _run_job_name(run_dt)
+    if get_last_sync(SOURCE, run_job) is not None:
+        logger.info(f"[GFS RISK] Run {run_dt.isoformat()} already ingested — skip")
+        return
+
     logger.info(f"[GFS RISK] Using run: {run_dt.isoformat()}")
 
     total = 0
+    missing = 0
     for fhour in FORECAST_HOURS:
         valid_dt = run_dt + timedelta(hours=fhour)
 
@@ -339,6 +349,7 @@ def run_gfs_risk_crawler():
             raw = _download_gfs_grib2(run_dt, run_hour, fhour)
             if raw is None:
                 log_data["records_processed"] = 0
+                missing += 1
                 continue
 
             log_data["checksum"] = sha256_of_bytes(raw)
@@ -358,10 +369,55 @@ def run_gfs_risk_crawler():
             finally:
                 db.close()
 
+    # Only mark the run done when every forecast hour downloaded, so a partial
+    # run (NOMADS still publishing, 5xx) is retried on the next poll.
+    if missing == 0:
+        with sync_log(SOURCE, run_job) as log_data:
+            log_data["records_processed"] = total
+        purge_old_risk_runs()
+
     # Invalidate risk cache and PNG tiles so next request gets fresh data
     cache_delete("lightning:risk:latest_run")
     cache_invalidate_lightning_tiles()
     logger.info(f"[GFS RISK] Done. Total grid points stored: {total}")
+
+
+def _run_job_name(run_dt: datetime) -> str:
+    return f"gfs_risk_run_{run_dt:%Y%m%d%H}"
+
+
+def purge_old_risk_runs(keep_runs: Optional[int] = None) -> int:
+    """Delete GFS risk rows for all but the newest keep_runs runs.
+
+    Every endpoint reads only the latest run; older runs were never deleted
+    and piled up in Postgres.
+    """
+    keep = max(1, settings.gfs_risk_keep_runs if keep_runs is None else keep_runs)
+    db = SessionLocal()
+    try:
+        runs = (
+            db.query(LightningRiskForecast.run_time_utc)
+            .filter(LightningRiskForecast.model_source == MODEL)
+            .distinct()
+            .order_by(LightningRiskForecast.run_time_utc.desc())
+            .all()
+        )
+        if len(runs) <= keep:
+            return 0
+        cutoff = runs[keep - 1][0]
+        deleted = (
+            db.query(LightningRiskForecast)
+            .filter(
+                LightningRiskForecast.model_source == MODEL,
+                LightningRiskForecast.run_time_utc < cutoff,
+            )
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        logger.info(f"[GFS RISK] Purged {deleted} rows from runs older than {cutoff.isoformat()}")
+        return deleted
+    finally:
+        db.close()
 
 
 def query_risk_at_point(lat: float, lon: float, hours: int = 24,
