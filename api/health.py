@@ -17,6 +17,11 @@ router = APIRouter(prefix="/api/v1", tags=["health"])
 
 SOURCES = ["NHC", "JMA", "JTWC", "IBTrACS"]
 
+# IBTrACS is imported once a day (cron 02:00 UTC); judging it by the 90-min
+# threshold of the 15-30 min crawlers flagged it stale ~22h a day and kept
+# /api/v1/health permanently "degraded". Allow a day plus slack.
+STALE_THRESHOLD_OVERRIDES_MIN = {"IBTrACS": 26 * 60}
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -49,7 +54,8 @@ def health(db: Session = Depends(get_db)):
         stale_min = None
         if last_ok and last_ok.finished_at:
             stale_min = _stale_minutes(last_ok.finished_at)
-            stale = stale_min > settings.stale_threshold_minutes
+            threshold = STALE_THRESHOLD_OVERRIDES_MIN.get(source, settings.stale_threshold_minutes)
+            stale = stale_min > threshold
 
         entries.append(
             SourceHealthEntry(
